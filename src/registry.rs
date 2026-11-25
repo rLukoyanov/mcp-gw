@@ -6,7 +6,7 @@ use rmcp::service::RunningServiceCancellationToken;
 use rmcp::service::{Peer, RoleClient};
 use tokio::sync::Mutex;
 
-use crate::config::ServerConfig;
+use crate::config::{CompressionSettings, ServerConfig};
 
 /// One tool aggregated from an upstream MCP server.
 #[derive(Clone)]
@@ -39,6 +39,8 @@ pub struct GatewayState {
     catalog: RwLock<Vec<CatalogEntry>>,
     peers: RwLock<HashMap<String, Peer<RoleClient>>>,
     tokens: RwLock<HashMap<String, RunningServiceCancellationToken>>,
+    /// When set, large tool results are compressed through this server.
+    compressor: RwLock<Option<CompressionSettings>>,
     /// Serializes `enable_server` / `disable_server` so concurrent requests
     /// cannot open or tear down the same connection twice.
     lifecycle: Mutex<()>,
@@ -51,6 +53,14 @@ impl GatewayState {
 
     pub fn lifecycle(&self) -> &Mutex<()> {
         &self.lifecycle
+    }
+
+    pub fn set_compressor(&self, settings: Option<CompressionSettings>) {
+        *self.compressor.write().unwrap() = settings;
+    }
+
+    pub fn compressor(&self) -> Option<CompressionSettings> {
+        self.compressor.read().unwrap().clone()
     }
 
     pub fn register_config(&self, config: ServerConfig) {
@@ -109,7 +119,16 @@ impl GatewayState {
         let mut catalog = self.catalog.write().unwrap();
         catalog.retain(|entry| entry.server != server);
 
+        // The compressor is invoked by the gateway automatically, so hide its
+        // compress tool from the model to avoid double compression.
+        let hidden_tool = self.compressor().and_then(|settings| {
+            (settings.enabled && settings.server == server).then_some(settings.compress_tool)
+        });
+
         for tool in tools {
+            if hidden_tool.as_deref() == Some(tool.name.as_ref()) {
+                continue;
+            }
             let base = tool.name.to_string();
             let mut name = base.clone();
             if catalog.iter().any(|entry| entry.name == name) {
@@ -325,5 +344,27 @@ mod tests {
 
         assert_eq!(state.servers("demo", 10).len(), 1);
         assert!(state.servers("nothing", 10).is_empty());
+    }
+
+    #[test]
+    fn hides_the_compressor_tool_from_the_catalog() {
+        let state = GatewayState::new();
+        state.set_compressor(Some(CompressionSettings {
+            server: "headroom".into(),
+            min_bytes: 512,
+            enabled: true,
+            compress_tool: "headroom_compress".into(),
+            retrieve_tool: "headroom_retrieve".into(),
+        }));
+        state.replace_server_tools(
+            "headroom",
+            vec![
+                tool("headroom_compress", "compress"),
+                tool("headroom_retrieve", "retrieve"),
+            ],
+        );
+
+        assert!(state.get("headroom_compress").is_none());
+        assert!(state.get("headroom_retrieve").is_some());
     }
 }

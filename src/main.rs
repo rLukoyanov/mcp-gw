@@ -1,4 +1,5 @@
 mod code_mode;
+mod compression;
 mod config;
 mod registry;
 mod upstream;
@@ -325,9 +326,11 @@ impl GatewayServer {
             }
         }
 
-        peer.call_tool(request)
-            .await
-            .map_err(|err| ErrorData::internal_error(format!("upstream call failed: {err}"), None))
+        let result = peer.call_tool(request).await.map_err(|err| {
+            ErrorData::internal_error(format!("upstream call failed: {err}"), None)
+        })?;
+
+        Ok(compression::compress(&self.state, &entry.server, result).await)
     }
 
     /// Programmatic tool calling: run model-written JavaScript in a sandbox that
@@ -398,14 +401,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = config_path();
     match config::McpConfig::load(&path) {
         Ok(config) => {
-            let servers = config.into_servers();
+            let (servers, compression) = config.into_parts();
             for server in &servers {
                 state.register_config(server.clone());
             }
 
+            if let Some(settings) = compression {
+                if servers.iter().any(|server| server.name == settings.server) {
+                    state.set_compressor(Some(settings));
+                } else {
+                    eprintln!(
+                        "compression: server '{}' is not configured; auto-compression disabled",
+                        settings.server
+                    );
+                }
+            }
+
+            let compressor_server = state.compressor().map(|settings| settings.server);
             let auto_connect: Vec<_> = servers
                 .into_iter()
-                .filter(|server| server.auto_connect)
+                .filter(|server| {
+                    server.auto_connect || Some(&server.name) == compressor_server.as_ref()
+                })
                 .collect();
 
             let mut tasks = tokio::task::JoinSet::new();

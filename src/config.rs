@@ -8,6 +8,10 @@ use serde::Deserialize;
 ///
 /// ```json
 /// {
+///   "compression": {
+///     "server": "headroom",
+///     "minBytes": 512
+///   },
 ///   "mcpServers": {
 ///     "local": {
 ///       "command": "npx",
@@ -27,10 +31,47 @@ use serde::Deserialize;
 /// `description` feeds `search_servers`; `autoConnect` (default `true`) controls
 /// whether the gateway connects at startup or only when the model calls
 /// `enable_server`.
+///
+/// The optional `compression` block routes every large `call_tool` result
+/// through the named upstream server's `compressTool` (Headroom by default)
+/// before it reaches the model.
 #[derive(Debug, Default, Deserialize)]
 pub struct McpConfig {
     #[serde(rename = "mcpServers", default)]
     pub servers: HashMap<String, RawServer>,
+    #[serde(default)]
+    pub compression: Option<CompressionSettings>,
+}
+
+/// Auto-compression via an upstream MCP server (Headroom).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompressionSettings {
+    /// Name of the configured server that exposes the compression tools.
+    pub server: String,
+    /// Only results at least this many bytes are compressed. Defaults to 512.
+    #[serde(rename = "minBytes", default = "default_min_bytes")]
+    pub min_bytes: usize,
+    /// Disable compression without removing the config block.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Tool that compresses content. Defaults to `headroom_compress`.
+    #[serde(rename = "compressTool", default = "default_compress_tool")]
+    pub compress_tool: String,
+    /// Tool named in the hint so the model can recover the original.
+    #[serde(rename = "retrieveTool", default = "default_retrieve_tool")]
+    pub retrieve_tool: String,
+}
+
+fn default_min_bytes() -> usize {
+    512
+}
+
+fn default_compress_tool() -> String {
+    "headroom_compress".to_string()
+}
+
+fn default_retrieve_tool() -> String {
+    "headroom_retrieve".to_string()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -65,8 +106,10 @@ impl McpConfig {
 
     /// Convert raw entries into validated server configs, logging and skipping
     /// any entry that does not describe exactly one transport.
-    pub fn into_servers(self) -> Vec<ServerConfig> {
-        self.servers
+    pub fn into_parts(self) -> (Vec<ServerConfig>, Option<CompressionSettings>) {
+        let compression = self.compression;
+        let servers = self
+            .servers
             .into_iter()
             .filter_map(
                 |(name, raw)| match ServerConfig::from_raw(name.clone(), raw) {
@@ -77,7 +120,14 @@ impl McpConfig {
                     }
                 },
             )
-            .collect()
+            .collect();
+        (servers, compression)
+    }
+
+    /// Convenience for tests that do not care about compression settings.
+    #[cfg(test)]
+    pub fn into_servers(self) -> Vec<ServerConfig> {
+        self.into_parts().0
     }
 }
 
@@ -169,5 +219,44 @@ mod tests {
         let config =
             parse(r#"{ "mcpServers": { "x": { "command": "a", "url": "https://e/mcp" } } }"#);
         assert!(config.into_servers().is_empty());
+    }
+
+    #[test]
+    fn parses_compression_settings_with_defaults() {
+        let config = parse(
+            r#"{
+                "compression": { "server": "headroom" },
+                "mcpServers": {}
+            }"#,
+        );
+        let (_, compression) = config.into_parts();
+        let compression = compression.expect("compression block");
+        assert_eq!(compression.server, "headroom");
+        assert_eq!(compression.min_bytes, 512);
+        assert!(compression.enabled);
+        assert_eq!(compression.compress_tool, "headroom_compress");
+        assert_eq!(compression.retrieve_tool, "headroom_retrieve");
+    }
+
+    #[test]
+    fn parses_compression_overrides() {
+        let config = parse(
+            r#"{
+                "compression": {
+                    "server": "hr",
+                    "minBytes": 10,
+                    "enabled": false,
+                    "compressTool": "c",
+                    "retrieveTool": "r"
+                },
+                "mcpServers": {}
+            }"#,
+        );
+        let (_, compression) = config.into_parts();
+        let compression = compression.expect("compression block");
+        assert_eq!(compression.min_bytes, 10);
+        assert!(!compression.enabled);
+        assert_eq!(compression.compress_tool, "c");
+        assert_eq!(compression.retrieve_tool, "r");
     }
 }
