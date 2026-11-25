@@ -80,7 +80,16 @@ MCP Inspector и т.п.):
 
 ```json
 {
+  "compression": {
+    "server": "headroom",
+    "minBytes": 512
+  },
   "mcpServers": {
+    "headroom": {
+      "command": "headroom",
+      "args": ["mcp", "serve"],
+      "description": "Headroom compression/retrieval"
+    },
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/projects"],
@@ -113,6 +122,59 @@ MCP Inspector и т.п.):
 
 > Подстановки переменных окружения в `mcp.json` нет — значения записываются буквально.
 > Держите файл с секретами вне системы контроля версий.
+
+## Авто-сжатие через Headroom
+
+Если указан блок `compression`, каждый результат `call_tool` крупнее `minBytes`
+автоматически прогоняется через `headroom_compress` указанного upstream-сервера.
+Модель получает сжатый текст, `hash` и `savings_percent`, а полный оригинал при
+необходимости достаёт через `headroom_retrieve`.
+
+```json
+{
+  "compression": {
+    "server": "headroom",
+    "minBytes": 512,
+    "enabled": true,
+    "compressTool": "headroom_compress",
+    "retrieveTool": "headroom_retrieve"
+  },
+  "mcpServers": {
+    "headroom": {
+      "command": "headroom",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+```
+
+| Поле | По умолчанию | Описание |
+|------|--------------|----------|
+| `server` | — | Имя сервера в `mcpServers`, предоставляющего инструменты сжатия. |
+| `minBytes` | `512` | Сжимать только результаты не меньше этого размера. |
+| `enabled` | `true` | Выключить сжатие, не удаляя блок. |
+| `compressTool` | `headroom_compress` | Инструмент сжатия. |
+| `retrieveTool` | `headroom_retrieve` | Инструмент восстановления (используется в подсказке модели). |
+
+Поведение:
+
+- Сервер сжатия подключается на старте автоматически, даже если у него `autoConnect: false`.
+- Инструмент `compressTool` **скрывается** из каталога модели, чтобы она не сжимала повторно;
+  `headroom_retrieve` и `headroom_stats` остаются доступными.
+- Результаты самого сервера сжатия (например, `headroom_retrieve`) не сжимаются повторно.
+- Сжатие **fail-open**: если сервер не подключён, вернул ошибку или не сэкономил байты,
+  возвращается исходный результат.
+- Промежуточные вызовы внутри `execute_code` не сжимаются — они и так не попадают в контекст;
+  сжимаются только результаты `call_tool`, которые видит модель.
+
+Для локальной проверки без Headroom есть заглушка `demo_headroom`
+(`headroom_compress` / `headroom_retrieve` / `headroom_stats`):
+
+```bash
+cargo build
+# в mcp.json: "compression": { "server": "headroom", "minBytes": 20 }
+#             "headroom": { "command": "<repo>/target/debug/demo_headroom" }
+```
 
 ## Инструменты шлюза
 
@@ -218,6 +280,8 @@ printf '%s\n' \
 - Нет OAuth/авторизации для HTTP-серверов (только статические заголовки).
 - Code mode — только JavaScript.
 - `mcp.json` не поддерживает подстановку env-переменных.
+- Авто-сжатие работает только при подключённом сервере Headroom (или совместимом
+  MCP-сервере с инструментами `headroom_compress` / `headroom_retrieve`).
 
 ## Разработка
 
@@ -235,5 +299,7 @@ cargo fmt
 | `src/config.rs` | Парсинг `mcp.json`. |
 | `src/registry.rs` | Каталог тулов, реестр серверов, соединения. |
 | `src/upstream.rs` | MCP-клиент к upstream, `enable`/`disable`, `list_changed`. |
+| `src/compression.rs` | Авто-сжатие результатов через `headroom_compress`. |
 | `src/code_mode.rs` | Песочница QuickJS и брокер `callTool`. |
 | `src/bin/demo_upstream.rs` | Демо upstream-сервер для тестов. |
+| `src/bin/demo_headroom.rs` | Заглушка Headroom для проверки авто-сжатия. |
