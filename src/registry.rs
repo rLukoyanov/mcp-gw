@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use rmcp::model::Tool;
-use rmcp::service::{Peer, RoleClient};
 use rmcp::service::RunningServiceCancellationToken;
+use rmcp::service::{Peer, RoleClient};
 use tokio::sync::Mutex;
 
 use crate::config::ServerConfig;
@@ -194,6 +194,15 @@ impl GatewayState {
             .iter()
             .find(|entry| entry.name == name)
             .cloned()
+    }
+
+    pub fn tool_count_for(&self, server: &str) -> usize {
+        self.catalog
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.server == server)
+            .count()
     }
 
     pub fn len(&self) -> usize {

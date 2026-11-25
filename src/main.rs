@@ -1,9 +1,11 @@
+mod code_mode;
 mod config;
 mod registry;
 mod upstream;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
@@ -20,8 +22,9 @@ use serde_json::Value;
 use registry::{CatalogEntry, GatewayState};
 
 /// Meta-tools implement the "progressive discovery" pattern: the model first
-/// searches a compact catalog, inspects only the tool it needs, then executes
-/// it. Upstream tool definitions never all enter the context at once.
+/// discovers servers, searches a compact catalog, inspects only the tool it
+/// needs, then executes it. Upstream tool definitions never all enter the
+/// context at once, and servers can be connected or dropped on demand.
 #[derive(Clone)]
 struct GatewayServer {
     state: Arc<GatewayState>,
@@ -37,6 +40,42 @@ enum DetailLevel {
     Summary,
     /// Everything, including the input schema.
     Full,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchServersParams {
+    /// Free-text query matched against server name and description. Omit to list all.
+    query: Option<String>,
+    /// Maximum number of results to return (defaults to 20).
+    limit: Option<usize>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct ServerSummary {
+    name: String,
+    description: String,
+    connected: bool,
+    tool_count: usize,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct SearchServersResult {
+    query: String,
+    total: usize,
+    servers: Vec<ServerSummary>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ServerActionParams {
+    /// Exact server name, as returned by `search_servers`.
+    name: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct ServerStatus {
+    name: String,
+    connected: bool,
+    tool_count: usize,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -96,12 +135,112 @@ struct CallToolParams {
     arguments: Option<Value>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExecuteCodeParams {
+    /// JavaScript to run. It has access to `await callTool(name, args)` and `console.*`.
+    code: String,
+    /// Execution timeout in milliseconds (default 10000, max 60000).
+    timeout_ms: Option<u64>,
+}
+
 #[tool_router]
 impl GatewayServer {
+    /// Dynamic server management: list configured servers and whether they are connected.
+    #[tool(
+        name = "search_servers",
+        description = "List or search configured upstream MCP servers with their connection status and tool counts. Use enable_server to connect a server that is not connected."
+    )]
+    fn search_servers(
+        &self,
+        Parameters(SearchServersParams { query, limit }): Parameters<SearchServersParams>,
+    ) -> Json<SearchServersResult> {
+        let query = query.unwrap_or_default();
+        let limit = limit.unwrap_or(20).clamp(1, 100);
+        let servers: Vec<ServerSummary> = self
+            .state
+            .servers(&query, limit)
+            .into_iter()
+            .map(|server| ServerSummary {
+                name: server.name,
+                description: server.description,
+                connected: server.connected,
+                tool_count: server.tool_count,
+            })
+            .collect();
+        Json(SearchServersResult {
+            query,
+            total: servers.len(),
+            servers,
+        })
+    }
+
+    /// Dynamic server management: connect an upstream server and load its tools.
+    #[tool(
+        name = "enable_server",
+        description = "Connect to a configured upstream MCP server and add its tools to the catalog. Idempotent: enabling an already-connected server is a no-op."
+    )]
+    async fn enable_server(
+        &self,
+        Parameters(ServerActionParams { name }): Parameters<ServerActionParams>,
+    ) -> Result<Json<ServerStatus>, ErrorData> {
+        let config = self.state.config(&name).ok_or_else(|| {
+            ErrorData::resource_not_found(format!("server '{name}' is not configured"), None)
+        })?;
+
+        let _guard = self.state.lifecycle().lock().await;
+        if self.state.is_connected(&name) {
+            return Ok(Json(ServerStatus {
+                name,
+                connected: true,
+                tool_count: self.state.tool_count_for(&config.name),
+            }));
+        }
+
+        let tool_count = upstream::enable(&config, self.state.clone())
+            .await
+            .map_err(|err| {
+                ErrorData::internal_error(
+                    format!("failed to enable server '{name}': {err:#}"),
+                    None,
+                )
+            })?;
+
+        Ok(Json(ServerStatus {
+            name,
+            connected: true,
+            tool_count,
+        }))
+    }
+
+    /// Dynamic server management: disconnect a server and drop its tools.
+    #[tool(
+        name = "disable_server",
+        description = "Disconnect an upstream MCP server and remove its tools from the catalog, freeing context. Use enable_server to reconnect it later."
+    )]
+    async fn disable_server(
+        &self,
+        Parameters(ServerActionParams { name }): Parameters<ServerActionParams>,
+    ) -> Result<Json<ServerStatus>, ErrorData> {
+        if self.state.config(&name).is_none() {
+            return Err(ErrorData::resource_not_found(
+                format!("server '{name}' is not configured"),
+                None,
+            ));
+        }
+
+        let _guard = self.state.lifecycle().lock().await;
+        self.state.disconnect(&name);
+        Ok(Json(ServerStatus {
+            name,
+            connected: false,
+            tool_count: 0,
+        }))
+    }
+
     /// Layer 1 — catalog: search available tools by keyword.
     #[tool(
         name = "search_tools",
-        description = "Search the catalog of tools available through the gateway. Returns matching tool names and the upstream server that provides them, with optional descriptions and schemas."
+        description = "Search the catalog of tools available through connected servers. Returns matching tool names and the upstream server that provides them, with optional descriptions and schemas."
     )]
     fn search_tools(
         &self,
@@ -190,6 +329,21 @@ impl GatewayServer {
             .await
             .map_err(|err| ErrorData::internal_error(format!("upstream call failed: {err}"), None))
     }
+
+    /// Programmatic tool calling: run model-written JavaScript in a sandbox that
+    /// composes multiple tool calls without streaming intermediate results
+    /// through the model's context.
+    #[tool(
+        name = "execute_code",
+        description = "Run JavaScript in an isolated sandbox (no filesystem or network). The code may call `await callTool(name, args)` to invoke gateway tools and `console.log(...)` for output; only the logs and the final value are returned. Use this to chain or filter tool results without passing them through context."
+    )]
+    async fn execute_code(
+        &self,
+        Parameters(ExecuteCodeParams { code, timeout_ms }): Parameters<ExecuteCodeParams>,
+    ) -> CallToolResult {
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(10_000).clamp(100, 60_000));
+        code_mode::execute(&code, self.state.clone(), timeout).await
+    }
 }
 
 #[tool_handler]
@@ -198,8 +352,10 @@ impl ServerHandler for GatewayServer {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("mcp-gw", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Progressive tool discovery gateway. Use search_tools to find capabilities, \
-             get_tool_details to inspect a tool's schema, then call_tool to invoke it."
+                "Progressive tool discovery gateway. Use search_servers/enable_server to control \
+                 which upstream servers are connected, search_tools to find capabilities, \
+                 get_tool_details to inspect a tool's schema, call_tool to invoke one tool, or \
+                 execute_code to compose several calls in a sandbox."
                     .to_string(),
             )
     }
@@ -243,13 +399,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match config::McpConfig::load(&path) {
         Ok(config) => {
             let servers = config.into_servers();
+            for server in &servers {
+                state.register_config(server.clone());
+            }
+
+            let auto_connect: Vec<_> = servers
+                .into_iter()
+                .filter(|server| server.auto_connect)
+                .collect();
+
             let mut tasks = tokio::task::JoinSet::new();
-            for server in servers {
+            for server in auto_connect {
                 let state = state.clone();
                 tasks.spawn(async move {
                     let name = server.name.clone();
-                    match upstream::connect_and_register(&server, state).await {
-                        Ok(()) => None,
+                    match upstream::enable(&server, state).await {
+                        Ok(_) => None,
                         Err(err) => Some(format!("server '{name}': {err:#}")),
                     }
                 });

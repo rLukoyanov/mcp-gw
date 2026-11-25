@@ -51,7 +51,13 @@ fn wrap(code: &str) -> String {
     }}
     return JSON.stringify({{ ok: true, result: __data }});
   }} catch (e) {{
-    const __message = e && (e.stack || e.message) ? String(e.stack || e.message) : String(e);
+    let __message;
+    if (e && typeof e === "object" && e.message) {{
+      __message = (e.name ? e.name + ": " : "") + e.message;
+      if (e.stack) __message += "\n" + e.stack;
+    }} else {{
+      __message = String(e);
+    }}
     return JSON.stringify({{ ok: false, error: __message }});
   }}
 }})()"#
@@ -144,10 +150,16 @@ async fn run(
             let promise = match ctx.eval::<Promise, _>(script.as_str()) {
                 Ok(promise) => promise,
                 Err(_) => {
-                    let message = ctx
-                        .catch()
-                        .get::<String>()
-                        .unwrap_or_else(|_| "syntax error".to_string());
+                    if Instant::now() >= deadline {
+                        let message = format!("execution timed out after {timeout:?}");
+                        return Ok(json!({ "ok": false, "error": message }).to_string());
+                    }
+                    let caught = ctx.catch();
+                    let message = caught
+                        .as_exception()
+                        .and_then(|exception| exception.message())
+                        .or_else(|| caught.get::<String>().ok())
+                        .unwrap_or_else(|| "script error".to_string());
                     return Ok(json!({ "ok": false, "error": message }).to_string());
                 }
             };
@@ -158,7 +170,7 @@ async fn run(
 
     match result {
         Ok(envelope) => Ok(envelope),
-        Err(err) if Instant::now() >= deadline => {
+        Err(_) if Instant::now() >= deadline => {
             Err(format!("execution timed out after {timeout:?}"))
         }
         Err(err) => Err(format!("sandbox error: {err}")),

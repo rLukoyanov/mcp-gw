@@ -4,16 +4,29 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
-/// Configuration file format (Claude Desktop compatible):
+/// Configuration file format (Claude Desktop compatible, with two extensions):
 ///
 /// ```json
 /// {
 ///   "mcpServers": {
-///     "local": { "command": "npx", "args": ["-y", "some-server"], "env": { "KEY": "value" } },
-///     "remote": { "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer ..." } }
+///     "local": {
+///       "command": "npx",
+///       "args": ["-y", "some-server"],
+///       "env": { "KEY": "value" },
+///       "description": "What this server provides",
+///       "autoConnect": false
+///     },
+///     "remote": {
+///       "url": "https://example.com/mcp",
+///       "headers": { "Authorization": "Bearer ..." }
+///     }
 ///   }
 /// }
 /// ```
+///
+/// `description` feeds `search_servers`; `autoConnect` (default `true`) controls
+/// whether the gateway connects at startup or only when the model calls
+/// `enable_server`.
 #[derive(Debug, Default, Deserialize)]
 pub struct McpConfig {
     #[serde(rename = "mcpServers", default)]
