@@ -180,7 +180,7 @@ const SUMMARY_MAX_CHARS: usize = 200;
 /// Upper bound for a single batched `get_tool_details` call.
 const MAX_BATCH_DETAILS: usize = 20;
 /// Default threshold for automatic passthrough mode.
-const DEFAULT_PASSTHROUGH_MAX_TOOLS: usize = 15;
+const DEFAULT_PASSTHROUGH_MAX_TOOLS: usize = 20;
 
 #[tool_router]
 impl GatewayServer {
@@ -867,16 +867,17 @@ mod tests {
 
     #[test]
     fn auto_mode_requires_a_small_fully_connected_catalog() {
-        assert_eq!(choose_mode(None, true, 10, 15), Mode::Passthrough);
-        assert_eq!(choose_mode(None, true, 16, 15), Mode::Discovery);
-        assert_eq!(choose_mode(None, false, 10, 15), Mode::Discovery);
-        assert_eq!(choose_mode(None, true, 0, 15), Mode::Discovery);
+        assert_eq!(choose_mode(None, true, 10, 20), Mode::Passthrough);
+        assert_eq!(choose_mode(None, true, 16, 20), Mode::Passthrough);
+        assert_eq!(choose_mode(None, true, 21, 20), Mode::Discovery);
+        assert_eq!(choose_mode(None, false, 10, 20), Mode::Discovery);
+        assert_eq!(choose_mode(None, true, 0, 20), Mode::Discovery);
         assert_eq!(
-            choose_mode(Some(Mode::Discovery), true, 3, 15),
+            choose_mode(Some(Mode::Discovery), true, 3, 20),
             Mode::Discovery
         );
         assert_eq!(
-            choose_mode(Some(Mode::Passthrough), false, 3, 15),
+            choose_mode(Some(Mode::Passthrough), false, 3, 20),
             Mode::Passthrough
         );
     }

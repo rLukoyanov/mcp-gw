@@ -94,7 +94,7 @@ get_tool_details, search_servers, search_tools
 (`autoConnect: false`) и подключается только по запросу модели.
 
 > Здесь выбран discovery, потому что демо-сервер ленивый. Если все серверы
-> `autoConnect: true`, подключились, и тулов не больше 15, `auto` выберет
+> `autoConnect: true`, подключились, и тулов не больше 20, `auto` выберет
 > passthrough — тогда `tools/list` вернёт `echo` и `ping` напрямую.
 
 Дальше модель (или MCP-клиент) проходит цикл:
@@ -222,7 +222,7 @@ upstream-тулы появляются в каталоге после `enable_se
   Авто-сжатие Headroom продолжает работать. Мета-тулы и `execute_code` в этом режиме
   недоступны, а ленивые/отключённые серверы не попадают в список.
 
-Порог задаётся `TOKENMAXING_PASSTHROUGH_MAX_TOOLS` (1–10 000, по умолчанию 15).
+Порог задаётся `TOKENMAXING_PASSTHROUGH_MAX_TOOLS` (1–10 000, по умолчанию 20).
 В passthrough шлюз пересылает клиенту `notifications/tools/list_changed`, когда upstream
 меняет набор тулов; в discovery `tools/list` стабилен, а каталог обновляется внутренне.
 
@@ -591,7 +591,7 @@ cache-hit'ы на свои 47 определений (input падает до 26
 |------------|--------------|------------|
 | `TOKENMAXING_CONFIG` | `./mcp.json` | Путь к файлу конфигурации. |
 | `TOKENMAXING_MODE` | `auto` | `auto`, `discovery` или `passthrough`. |
-| `TOKENMAXING_PASSTHROUGH_MAX_TOOLS` | `15` | Верхняя граница каталога для auto-passthrough (1–10 000). |
+| `TOKENMAXING_PASSTHROUGH_MAX_TOOLS` | `20` | Верхняя граница каталога для auto-passthrough (1–10 000). |
 | `TOKENMAXING_METRICS_ADDR` | `127.0.0.1:9464` | Адрес HTTP-сервера метрик; `off` или пустая строка отключают. |
 | `TOKENMAXING_TOKENIZER` | `o200k_base` | Кодировка tiktoken: `o200k_base`, `cl100k_base`, `p50k_base`, `r50k_base`. Неизвестное значение → `o200k_base` с предупреждением. |
 
