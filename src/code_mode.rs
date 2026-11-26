@@ -206,14 +206,17 @@ async fn call_upstream(state: &GatewayState, name: &str, args_json: &str) -> Str
             "error": tool_error_text(&result),
         })
         .to_string(),
-        Ok(result) => match serde_json::to_value(&result) {
-            Ok(value) => json!({ "ok": true, "result": value }).to_string(),
-            Err(err) => json!({
-                "ok": false,
-                "error": format!("failed to serialize tool result: {err}"),
-            })
-            .to_string(),
-        },
+        Ok(result) => {
+            state.record_tool_use(&entry);
+            match serde_json::to_value(&result) {
+                Ok(value) => json!({ "ok": true, "result": value }).to_string(),
+                Err(err) => json!({
+                    "ok": false,
+                    "error": format!("failed to serialize tool result: {err}"),
+                })
+                .to_string(),
+            }
+        }
         Err(err) => json!({
             "ok": false,
             "error": format!("upstream call failed: {err}"),

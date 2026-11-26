@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex as StdMutex, RwLock};
 
 use rmcp::RoleServer;
 use rmcp::model::Tool;
@@ -9,6 +9,7 @@ use rmcp::service::RunningServiceCancellationToken;
 use rmcp::service::{Peer, RoleClient};
 use tokio::sync::Mutex;
 
+use crate::cache::{HotTool, UsageCache};
 use crate::config::{CompressionSettings, ServerConfig};
 use crate::metrics;
 
@@ -53,6 +54,8 @@ pub struct GatewayState {
     passthrough: AtomicBool,
     /// The downstream client, learned from the first `tools/list` request.
     client_peer: RwLock<Option<Peer<RoleServer>>>,
+    /// Tools the model has called, persisted across sessions.
+    usage: StdMutex<UsageCache>,
 }
 
 impl GatewayState {
@@ -124,6 +127,19 @@ impl GatewayState {
 
     pub fn set_passthrough(&self, enabled: bool) {
         self.passthrough.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_usage(&self, cache: UsageCache) {
+        *self.usage.lock().unwrap() = cache;
+    }
+
+    /// Remember a successful tool call for ranking and instruction hints.
+    pub fn record_tool_use(&self, entry: &CatalogEntry) {
+        self.usage.lock().unwrap().record(entry);
+    }
+
+    pub fn hot_tools(&self, limit: usize) -> Vec<HotTool> {
+        self.usage.lock().unwrap().hot(limit)
     }
 
     /// Remember the downstream client so upstream tool changes can be relayed.
@@ -273,11 +289,17 @@ impl GatewayState {
             .collect();
 
         let catalog = self.catalog.read().unwrap();
+        let usage = self.usage.lock().unwrap().counts();
         let mut scored: Vec<(u32, &CatalogEntry)> = catalog
             .iter()
             .filter_map(|entry| {
-                let score = score_entry(entry, &tokens);
-                (score > 0).then_some((score, entry))
+                let base = score_entry(entry, &tokens);
+                if base == 0 {
+                    return None;
+                }
+                // Nudge frequently used tools up without surfacing unrelated ones.
+                let boost = usage.get(&entry.name).copied().unwrap_or(0).min(20) as u32;
+                Some((base + boost, entry))
             })
             .collect();
 
@@ -436,6 +458,25 @@ mod tests {
 
         assert_eq!(state.servers("demo", 10).len(), 1);
         assert!(state.servers("nothing", 10).is_empty());
+    }
+
+    #[test]
+    fn usage_boosts_search_ranking() {
+        let state = GatewayState::new();
+        state.replace_server_tools(
+            "demo",
+            vec![
+                tool("alpha", "fetch a value"),
+                tool("beta", "fetch a value"),
+            ],
+        );
+        let entry = state.get("beta").unwrap();
+        for _ in 0..10 {
+            state.record_tool_use(&entry);
+        }
+
+        let results = state.search("fetch", 10);
+        assert_eq!(results[0].name, "beta");
     }
 
     #[test]

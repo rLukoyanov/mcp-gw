@@ -1,3 +1,4 @@
+mod cache;
 mod code_mode;
 mod compression;
 mod config;
@@ -58,25 +59,27 @@ struct GatewayServer {
     mode: Mode,
 }
 
-#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum DetailLevel {
-    /// Only the tool name and its server (default).
+    /// Compact schema for 1-3 matches, names otherwise (default).
     #[default]
+    Auto,
+    /// Name and server only.
     Name,
-    /// Name, title and a one-line description.
+    /// Name, title and one-line description.
     Summary,
-    /// The above plus a compact input schema without descriptions or examples.
+    /// Compact input schema.
     Schema,
-    /// Everything, including the complete input schema.
+    /// Full input schema.
     Full,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchServersParams {
-    /// Free-text query matched against server name and description. Omit to list all.
+    /// Match server name or description; omit for all.
     query: Option<String>,
-    /// Maximum number of results to return (defaults to 20).
+    /// Max results (default 20).
     limit: Option<usize>,
 }
 
@@ -97,7 +100,7 @@ struct SearchServersResult {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ServerActionParams {
-    /// Exact server name, as returned by `search_servers`.
+    /// Exact server name.
     name: String,
 }
 
@@ -110,11 +113,11 @@ struct ServerStatus {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchToolsParams {
-    /// Free-text query matched against tool name, title, description and server.
+    /// Search text.
     query: String,
-    /// Maximum number of results to return (defaults to 10).
+    /// Max results (default 10).
     limit: Option<usize>,
-    /// How much detail to include per result (defaults to `name`).
+    /// Detail level (default auto).
     detail: Option<DetailLevel>,
 }
 
@@ -139,9 +142,9 @@ struct SearchToolsResult {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetToolDetailsParams {
-    /// Exact tool name, as returned by `search_tools`.
+    /// Exact tool name.
     name: Option<String>,
-    /// Several exact tool names (at most 20). Returns `{ tools, missing }`.
+    /// Up to 20 exact tool names; returns `{ tools, missing }`.
     names: Option<Vec<String>>,
 }
 
@@ -160,18 +163,18 @@ struct ToolDetails {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CallToolParams {
-    /// Exact tool name, as returned by `search_tools`.
+    /// Exact tool name.
     name: String,
-    /// Arguments matching the tool's input schema (a JSON object).
+    /// JSON object matching the tool schema.
     #[serde(default)]
     arguments: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ExecuteCodeParams {
-    /// JavaScript to run. It has access to `await callTool(name, args)` and `console.*`.
+    /// JavaScript to run.
     code: String,
-    /// Execution timeout in milliseconds (default 10000, max 60000).
+    /// Timeout in ms (default 10000, max 60000).
     timeout_ms: Option<u64>,
 }
 
@@ -181,13 +184,17 @@ const SUMMARY_MAX_CHARS: usize = 200;
 const MAX_BATCH_DETAILS: usize = 20;
 /// Default threshold for automatic passthrough mode.
 const DEFAULT_PASSTHROUGH_MAX_TOOLS: usize = 20;
+/// `auto` returns compact schemas when at most this many tools match.
+const AUTO_SCHEMA_MAX_RESULTS: usize = 3;
+/// How many frequently used tools to mention in discovery instructions.
+const HOT_TOOL_HINTS: usize = 5;
 
 #[tool_router]
 impl GatewayServer {
-    /// Dynamic server management: list configured servers and whether they are connected.
+    /// List configured servers and whether they are connected.
     #[tool(
         name = "search_servers",
-        description = "List or search configured upstream MCP servers with their connection status and tool counts. Use enable_server to connect a server that is not connected."
+        description = "List configured upstream servers with connection status and tool counts."
     )]
     fn search_servers(
         &self,
@@ -214,10 +221,10 @@ impl GatewayServer {
         })
     }
 
-    /// Dynamic server management: connect an upstream server and load its tools.
+    /// Connect a server and load its tools.
     #[tool(
         name = "enable_server",
-        description = "Connect to a configured upstream MCP server and add its tools to the catalog. Idempotent: enabling an already-connected server is a no-op."
+        description = "Connect a configured upstream server and load its tools. Idempotent."
     )]
     async fn enable_server(
         &self,
@@ -260,10 +267,10 @@ impl GatewayServer {
         }))
     }
 
-    /// Dynamic server management: disconnect a server and drop its tools.
+    /// Disconnect a server and drop its tools.
     #[tool(
         name = "disable_server",
-        description = "Disconnect an upstream MCP server and remove its tools from the catalog, freeing context. Use enable_server to reconnect it later."
+        description = "Disconnect a server and remove its tools from the catalog."
     )]
     async fn disable_server(
         &self,
@@ -290,7 +297,7 @@ impl GatewayServer {
     /// Layer 1 — catalog: search available tools by keyword.
     #[tool(
         name = "search_tools",
-        description = "Search the catalog of tools available through connected servers. By default returns only tool names and their server; set detail to `summary` for one-line descriptions, `schema` for compact input schemas, or `full` for complete schemas."
+        description = "Search connected tools. Default auto: compact schemas for 1-3 matches, names otherwise. detail: auto|name|summary|schema|full."
     )]
     fn search_tools(
         &self,
@@ -300,9 +307,10 @@ impl GatewayServer {
             detail,
         }): Parameters<SearchToolsParams>,
     ) -> Json<SearchToolsResult> {
-        let detail = detail.unwrap_or_default();
+        let requested = detail.unwrap_or_default();
         let limit = limit.unwrap_or(10).clamp(1, 50);
         let matches = self.state.search(&query, limit);
+        let detail = effective_detail(requested, matches.len());
         metrics::record_meta_tool("search_tools", "ok");
         let result = SearchToolsResult {
             query,
@@ -321,7 +329,7 @@ impl GatewayServer {
     /// Layer 2 — inspect: fetch full definitions for one or several tools.
     #[tool(
         name = "get_tool_details",
-        description = "Get full definitions (input and output JSON schemas) for one tool via `name`, or up to 20 tools via `names`. Batched calls return `{ tools, missing }`."
+        description = "Full input/output schemas for one tool (`name`) or up to 20 (`names`)."
     )]
     fn get_tool_details(
         &self,
@@ -383,7 +391,7 @@ impl GatewayServer {
     /// Layer 3 — execute: call a tool on its owning upstream server.
     #[tool(
         name = "call_tool",
-        description = "Invoke a tool by its exact name with arguments matching its input schema. Routes the call to the upstream server that owns the tool."
+        description = "Call a tool by exact name with arguments matching its schema."
     )]
     async fn call_tool(
         &self,
@@ -403,7 +411,7 @@ impl GatewayServer {
     /// through the model's context.
     #[tool(
         name = "execute_code",
-        description = "Run JavaScript in an isolated sandbox (no filesystem or network). The code may call `await callTool(name, args)` to invoke gateway tools and `console.log(...)` for output; only the logs and the final value are returned. Use this to chain or filter tool results without passing them through context."
+        description = "Run sandboxed JavaScript with `await callTool(name,args)` and `console.*`; returns logs and result."
     )]
     async fn execute_code(
         &self,
@@ -424,6 +432,16 @@ impl GatewayServer {
 }
 
 impl GatewayServer {
+    /// The seven meta-tools with compact schemas. Prose is dropped from JSON
+    /// Schema while types, required fields and enums stay intact.
+    fn discovery_tools() -> Vec<Tool> {
+        Self::tool_router()
+            .list_all()
+            .into_iter()
+            .map(compact_tool)
+            .collect()
+    }
+
     /// Route one tool call to its owning upstream server. Shared by the
     /// `call_tool` meta-tool and passthrough mode.
     async fn forward_call(
@@ -484,6 +502,9 @@ impl GatewayServer {
             "ok"
         };
         metrics::record_tool_call(name, &entry.server, status, started.elapsed().as_secs_f64());
+        if status == "ok" {
+            self.state.record_tool_use(&entry);
+        }
         Ok(compression::compress(&self.state, &entry.server, result).await)
     }
 }
@@ -491,25 +512,30 @@ impl GatewayServer {
 #[tool_handler]
 impl ServerHandler for GatewayServer {
     fn get_info(&self) -> ServerConfig {
-        let instructions = match self.mode {
+        let mut instructions = match self.mode {
             Mode::Discovery => {
                 "Progressive tool discovery gateway. Use search_servers/enable_server to control \
-                 which upstream servers are connected, search_tools to find capabilities (name-only \
-                 by default; ask for summary or schema when needed), get_tool_details to inspect \
-                 one or more schemas, call_tool to invoke one tool, or execute_code to compose \
-                 several calls in a sandbox."
+                 which upstream servers are connected, search_tools to find capabilities (default \
+                 auto: compact schemas for 1-3 matches, names otherwise), get_tool_details to \
+                 inspect one or more schemas, call_tool to invoke one tool, or execute_code to \
+                 compose several calls in a sandbox."
+                    .to_string()
             }
             Mode::Passthrough => {
                 "All configured upstream MCP tools are exposed directly. Call them as regular MCP \
                  tools. Large results may be compressed automatically when compression is configured."
+                    .to_string()
             }
         };
+        if self.mode == Mode::Discovery {
+            append_hot_tool_hints(self, &mut instructions);
+        }
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "tokenmaxing",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(instructions.to_string())
+            .with_instructions(instructions)
     }
 
     async fn list_tools(
@@ -518,7 +544,7 @@ impl ServerHandler for GatewayServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let tools = match self.mode {
-            Mode::Discovery => Self::tool_router().list_all(),
+            Mode::Discovery => Self::discovery_tools(),
             Mode::Passthrough => {
                 self.state.set_client_peer(context.peer.clone());
                 self.state.catalog_tools()
@@ -539,7 +565,9 @@ impl ServerHandler for GatewayServer {
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         match self.mode {
-            Mode::Discovery => Self::tool_router().get(name).cloned(),
+            Mode::Discovery => Self::discovery_tools()
+                .into_iter()
+                .find(|tool| tool.name.as_ref() == name),
             Mode::Passthrough => self.state.catalog_tool(name),
         }
     }
@@ -564,11 +592,64 @@ impl ServerHandler for GatewayServer {
     }
 }
 
+/// Mention tools the model has called before so repeated tasks can skip search.
+fn append_hot_tool_hints(server: &GatewayServer, instructions: &mut String) {
+    // Over-fetch so stale cache entries do not shrink the hint list.
+    let hot = server.state.hot_tools(HOT_TOOL_HINTS * 4);
+    let mut present = Vec::new();
+    for hot in hot {
+        if present.len() >= HOT_TOOL_HINTS {
+            break;
+        }
+        if let Some(entry) = server.state.get(&hot.name) {
+            if entry.server != hot.server {
+                continue;
+            }
+            let description = entry
+                .tool
+                .description
+                .as_ref()
+                .map(|description| description.to_string())
+                .unwrap_or(hot.description);
+            present.push((hot.name, description));
+        } else if server.state.config(&hot.server).is_some()
+            && !server.state.is_connected(&hot.server)
+        {
+            present.push((
+                hot.name,
+                format!("{} (enable server '{}')", hot.description, hot.server),
+            ));
+        }
+    }
+    if present.is_empty() {
+        return;
+    }
+    instructions.push_str("\n\nFrequently used tools (call directly):");
+    for (name, description) in present {
+        instructions.push_str(&format!("\n- {name}: {}", one_line(&description, 120)));
+    }
+}
+
+fn compact_tool(mut tool: Tool) -> Tool {
+    if let Value::Object(compact) = compact_schema(&Value::Object((*tool.input_schema).clone())) {
+        tool.input_schema = std::sync::Arc::new(compact);
+    }
+    tool
+}
+
+fn effective_detail(requested: DetailLevel, matches: usize) -> DetailLevel {
+    match requested {
+        DetailLevel::Auto if matches <= AUTO_SCHEMA_MAX_RESULTS => DetailLevel::Schema,
+        DetailLevel::Auto => DetailLevel::Name,
+        other => other,
+    }
+}
+
 fn summarize(entry: &CatalogEntry, detail: &DetailLevel) -> ToolSummary {
     let tool = &entry.tool;
     let description = tool.description.as_ref().map(|d| d.to_string());
     let (title, description, input_schema) = match detail {
-        DetailLevel::Name => (None, None, None),
+        DetailLevel::Auto | DetailLevel::Name => (None, None, None),
         DetailLevel::Summary => (
             tool.title.clone(),
             description.map(|text| one_line(&text, SUMMARY_MAX_CHARS)),
@@ -737,6 +818,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(GatewayState::new());
 
     let path = config_path();
+    state.set_usage(cache::UsageCache::from_env(&path));
     let mode = match config::McpConfig::load(&path) {
         Ok(config) => {
             let (servers, compression) = config.into_parts();
@@ -809,8 +891,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.set_passthrough(mode == Mode::Passthrough);
     let server = GatewayServer { state, mode };
     if mode == Mode::Discovery {
-        let meta_tokens: u64 = GatewayServer::tool_router()
-            .list_all()
+        let meta_tokens: u64 = GatewayServer::discovery_tools()
             .iter()
             .map(|tool| metrics::count_tokens(&serde_json::to_string(tool).unwrap_or_default()))
             .sum();
@@ -863,6 +944,17 @@ mod tests {
         assert_eq!(compact["properties"]["path"]["type"], "string");
         assert_eq!(compact["required"], serde_json::json!(["path"]));
         assert_eq!(compact["additionalProperties"], false);
+    }
+
+    #[test]
+    fn auto_detail_uses_schemas_for_few_matches() {
+        assert_eq!(effective_detail(DetailLevel::Auto, 1), DetailLevel::Schema);
+        assert_eq!(effective_detail(DetailLevel::Auto, 3), DetailLevel::Schema);
+        assert_eq!(effective_detail(DetailLevel::Auto, 4), DetailLevel::Name);
+        assert_eq!(
+            effective_detail(DetailLevel::Summary, 1),
+            DetailLevel::Summary
+        );
     }
 
     #[test]
