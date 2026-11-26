@@ -1,0 +1,459 @@
+{
+  "generated_at": "2026-11-26T19:02:26.953921+00:00",
+  "model": "opencode-go/deepseek-v4.1-flash",
+  "catalog": "filesystem, 16 tools",
+  "prompts": 5,
+  "notes": "Single run, warm provider cache, no statistical significance. Cache variant has a prepopulated usage cache for the five filesystem tools.",
+  "aggregates": {
+    "direct": {
+      "runs": 5,
+      "total": 286734,
+      "input": 64019,
+      "output": 1318,
+      "cache_read": 220672,
+      "cache_write": 0,
+      "cost": 0.01149067,
+      "seconds": 69.9
+    },
+    "discovery": {
+      "runs": 5,
+      "total": 313397,
+      "input": 43608,
+      "output": 2152,
+      "cache_read": 266368,
+      "cache_write": 0,
+      "cost": 0.0093929,
+      "seconds": 95.8
+    },
+    "discovery_cache": {
+      "runs": 5,
+      "total": 304641,
+      "input": 42970,
+      "output": 2307,
+      "cache_read": 258304,
+      "cache_write": 0,
+      "cost": 0.00924061,
+      "seconds": 93.3
+    },
+    "passthrough": {
+      "runs": 5,
+      "total": 186875,
+      "input": 50805,
+      "output": 877,
+      "cache_read": 134656,
+      "cache_write": 0,
+      "cost": 0.00887312,
+      "seconds": 57.5
+    }
+  },
+  "runs": [
+    {
+      "seconds": 15.9,
+      "exit": 0,
+      "tokens": {
+        "total": 62724,
+        "input": 11872,
+        "output": 352,
+        "cache_read": 50432,
+        "cache_write": 0,
+        "cost": 0.002184096
+      },
+      "tools": [
+        "filesystem_read_text_file",
+        "filesystem_list_directory",
+        "filesystem_list_allowed_directories",
+        "filesystem_list_directory",
+        "filesystem_search_files",
+        "filesystem_read_text_file"
+      ],
+      "label": "direct",
+      "prompt": "Use the filesystem MCP tool read_text_file (not bash) to read README.md in the workspace and report its first heading."
+    },
+    {
+      "seconds": 15.5,
+      "exit": 0,
+      "tokens": {
+        "total": 46478,
+        "input": 8185,
+        "output": 320,
+        "cache_read": 37760,
+        "cache_write": 0,
+        "cost": 0.0016608299999999999
+      },
+      "tools": [
+        "mcp-gw_search_tools",
+        "mcp-gw_search_servers",
+        "mcp-gw_call_tool",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code"
+      ],
+      "label": "discovery",
+      "prompt": "Use the filesystem MCP tool read_text_file (not bash) to read README.md in the workspace and report its first heading."
+    },
+    {
+      "seconds": 17.8,
+      "exit": 0,
+      "tokens": {
+        "total": 56288,
+        "input": 8304,
+        "output": 397,
+        "cache_read": 47488,
+        "cache_write": 0,
+        "cost": 0.0016856639999999997
+      },
+      "tools": [
+        "mcp-gw_call_tool",
+        "mcp-gw_get_tool_details",
+        "mcp-gw_call_tool",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code"
+      ],
+      "label": "discovery_cache",
+      "prompt": "Use the filesystem MCP tool read_text_file (not bash) to read README.md in the workspace and report its first heading."
+    },
+    {
+      "seconds": 11.3,
+      "exit": 0,
+      "tokens": {
+        "total": 34803,
+        "input": 10019,
+        "output": 157,
+        "cache_read": 24576,
+        "cache_write": 0,
+        "cost": 0.001701378
+      },
+      "tools": [
+        "mcp-gw_read_text_file",
+        "mcp-gw_read_text_file"
+      ],
+      "label": "passthrough",
+      "prompt": "Use the filesystem MCP tool read_text_file (not bash) to read README.md in the workspace and report its first heading."
+    },
+    {
+      "seconds": 10.2,
+      "exit": 0,
+      "tokens": {
+        "total": 34902,
+        "input": 10067,
+        "output": 113,
+        "cache_read": 24576,
+        "cache_write": 0,
+        "cost": 0.001739178
+      },
+      "tools": [
+        "mcp-gw_list_directory",
+        "mcp-gw_list_directory"
+      ],
+      "label": "passthrough",
+      "prompt": "Use the filesystem MCP tool list_directory (not bash) on the workspace root and report how many entries it contains."
+    },
+    {
+      "seconds": 14.8,
+      "exit": 0,
+      "tokens": {
+        "total": 45852,
+        "input": 7889,
+        "output": 349,
+        "cache_read": 37504,
+        "cache_write": 0,
+        "cost": 0.001571262
+      },
+      "tools": [
+        "mcp-gw_call_tool",
+        "mcp-gw_call_tool",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code"
+      ],
+      "label": "discovery_cache",
+      "prompt": "Use the filesystem MCP tool list_directory (not bash) on the workspace root and report how many entries it contains."
+    },
+    {
+      "seconds": 17.5,
+      "exit": 0,
+      "tokens": {
+        "total": 65951,
+        "input": 8655,
+        "output": 480,
+        "cache_read": 56576,
+        "cache_write": 0,
+        "cost": 0.001899978
+      },
+      "tools": [
+        "mcp-gw_search_tools",
+        "mcp-gw_search_servers",
+        "mcp-gw_call_tool",
+        "mcp-gw_get_tool_details",
+        "mcp-gw_call_tool",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code"
+      ],
+      "label": "discovery",
+      "prompt": "Use the filesystem MCP tool list_directory (not bash) on the workspace root and report how many entries it contains."
+    },
+    {
+      "seconds": 10.3,
+      "exit": 0,
+      "tokens": {
+        "total": 36031,
+        "input": 10862,
+        "output": 121,
+        "cache_read": 24960,
+        "cache_write": 0,
+        "cost": 0.0018295800000000001
+      },
+      "tools": [
+        "filesystem_list_directory",
+        "filesystem_list_directory"
+      ],
+      "label": "direct",
+      "prompt": "Use the filesystem MCP tool list_directory (not bash) on the workspace root and report how many entries it contains."
+    },
+    {
+      "seconds": 15.0,
+      "exit": 0,
+      "tokens": {
+        "total": 63605,
+        "input": 18354,
+        "output": 299,
+        "cache_read": 44544,
+        "cache_write": 0,
+        "cost": 0.0033109320000000004
+      },
+      "tools": [
+        "filesystem_list_allowed_directories",
+        "filesystem_directory_tree",
+        "filesystem_search_files",
+        "filesystem_search_files"
+      ],
+      "label": "direct",
+      "prompt": "Use the filesystem MCP tool search_files (not bash) to find files containing 'line three' under the workspace and list the matching paths."
+    },
+    {
+      "seconds": 26.6,
+      "exit": 0,
+      "tokens": {
+        "total": 89125,
+        "input": 9750,
+        "output": 635,
+        "cache_read": 78336,
+        "cache_write": 0,
+        "cost": 0.002320908
+      },
+      "tools": [
+        "mcp-gw_search_tools",
+        "mcp-gw_get_tool_details",
+        "mcp-gw_call_tool",
+        "mcp-gw_execute_code",
+        "mcp-gw_search_tools",
+        "mcp-gw_call_tool",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code"
+      ],
+      "label": "discovery",
+      "prompt": "Use the filesystem MCP tool search_files (not bash) to find files containing 'line three' under the workspace and list the matching paths."
+    },
+    {
+      "seconds": 25.9,
+      "exit": 0,
+      "tokens": {
+        "total": 88061,
+        "input": 9399,
+        "output": 729,
+        "cache_read": 77568,
+        "cache_write": 0,
+        "cost": 0.002298954
+      },
+      "tools": [
+        "mcp-gw_search_tools",
+        "mcp-gw_search_tools",
+        "mcp-gw_call_tool",
+        "mcp-gw_call_tool",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code"
+      ],
+      "label": "discovery_cache",
+      "prompt": "Use the filesystem MCP tool search_files (not bash) to find files containing 'line three' under the workspace and list the matching paths."
+    },
+    {
+      "seconds": 15.1,
+      "exit": 0,
+      "tokens": {
+        "total": 47503,
+        "input": 10424,
+        "output": 318,
+        "cache_read": 36480,
+        "cache_write": 0,
+        "cost": 0.00203244
+      },
+      "tools": [
+        "mcp-gw_search_files",
+        "mcp-gw_search_files",
+        "grep"
+      ],
+      "label": "passthrough",
+      "prompt": "Use the filesystem MCP tool search_files (not bash) to find files containing 'line three' under the workspace and list the matching paths."
+    },
+    {
+      "seconds": 9.7,
+      "exit": 0,
+      "tokens": {
+        "total": 34732,
+        "input": 10114,
+        "output": 132,
+        "cache_read": 24448,
+        "cache_write": 0,
+        "cost": 0.001692444
+      },
+      "tools": [
+        "mcp-gw_get_file_info",
+        "mcp-gw_get_file_info"
+      ],
+      "label": "passthrough",
+      "prompt": "Use the filesystem MCP tool get_file_info (not bash) on data.json and report its size in bytes."
+    },
+    {
+      "seconds": 18.5,
+      "exit": 0,
+      "tokens": {
+        "total": 66048,
+        "input": 8665,
+        "output": 438,
+        "cache_read": 56832,
+        "cache_write": 0,
+        "cost": 0.0018008459999999996
+      },
+      "tools": [
+        "mcp-gw_get_tool_details",
+        "mcp-gw_call_tool",
+        "mcp-gw_call_tool",
+        "mcp-gw_execute_code",
+        "glob",
+        "mcp-gw_execute_code"
+      ],
+      "label": "discovery_cache",
+      "prompt": "Use the filesystem MCP tool get_file_info (not bash) on data.json and report its size in bytes."
+    },
+    {
+      "seconds": 18.7,
+      "exit": 0,
+      "tokens": {
+        "total": 55644,
+        "input": 8474,
+        "output": 321,
+        "cache_read": 46592,
+        "cache_write": 0,
+        "cost": 0.0017576760000000001
+      },
+      "tools": [
+        "mcp-gw_search_tools",
+        "mcp-gw_call_tool",
+        "mcp-gw_get_tool_details",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code"
+      ],
+      "label": "discovery",
+      "prompt": "Use the filesystem MCP tool get_file_info (not bash) on data.json and report its size in bytes."
+    },
+    {
+      "seconds": 12.3,
+      "exit": 0,
+      "tokens": {
+        "total": 61387,
+        "input": 11155,
+        "output": 247,
+        "cache_read": 49920,
+        "cache_write": 0,
+        "cost": 0.00201021
+      },
+      "tools": [
+        "filesystem_get_file_info",
+        "filesystem_list_directory",
+        "filesystem_search_files",
+        "filesystem_get_file_info"
+      ],
+      "label": "direct",
+      "prompt": "Use the filesystem MCP tool get_file_info (not bash) on data.json and report its size in bytes."
+    },
+    {
+      "seconds": 16.4,
+      "exit": 0,
+      "tokens": {
+        "total": 62987,
+        "input": 11776,
+        "output": 299,
+        "cache_read": 50816,
+        "cache_write": 0,
+        "cost": 0.0021558480000000006
+      },
+      "tools": [
+        "filesystem_read_multiple_files",
+        "filesystem_list_directory",
+        "filesystem_search_files",
+        "filesystem_read_multiple_files"
+      ],
+      "label": "direct",
+      "prompt": "Use the filesystem MCP tool read_multiple_files (not bash) to read README.md and notes.txt, then say which one mentions 'line three'."
+    },
+    {
+      "seconds": 17.5,
+      "exit": 0,
+      "tokens": {
+        "total": 56199,
+        "input": 8544,
+        "output": 396,
+        "cache_read": 47104,
+        "cache_write": 0,
+        "cost": 0.001753512
+      },
+      "tools": [
+        "mcp-gw_search_tools",
+        "mcp-gw_call_tool",
+        "mcp-gw_get_tool_details",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code"
+      ],
+      "label": "discovery",
+      "prompt": "Use the filesystem MCP tool read_multiple_files (not bash) to read README.md and notes.txt, then say which one mentions 'line three'."
+    },
+    {
+      "seconds": 16.3,
+      "exit": 0,
+      "tokens": {
+        "total": 48392,
+        "input": 8713,
+        "output": 394,
+        "cache_read": 38912,
+        "cache_write": 0,
+        "cost": 0.0018838859999999998
+      },
+      "tools": [
+        "mcp-gw_call_tool",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code",
+        "mcp-gw_execute_code"
+      ],
+      "label": "discovery_cache",
+      "prompt": "Use the filesystem MCP tool read_multiple_files (not bash) to read README.md and notes.txt, then say which one mentions 'line three'."
+    },
+    {
+      "seconds": 11.2,
+      "exit": 0,
+      "tokens": {
+        "total": 34935,
+        "input": 10181,
+        "output": 157,
+        "cache_read": 24576,
+        "cache_write": 0,
+        "cost": 0.0017076780000000002
+      },
+      "tools": [
+        "mcp-gw_read_multiple_files",
+        "mcp-gw_read_multiple_files"
+      ],
+      "label": "passthrough",
+      "prompt": "Use the filesystem MCP tool read_multiple_files (not bash) to read README.md and notes.txt, then say which one mentions 'line three'."
+    }
+  ]
+}
