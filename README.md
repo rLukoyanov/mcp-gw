@@ -37,7 +37,7 @@ MCP-шлюз на Rust: подключается к вашим MCP-сервер�
 upstream-серверов, которые запускаются через Node.
 
 ```bash
-git clone https://github.com/rLukoyanov/mcp-gw.git
+git clone https://github.com/rLukoyanov/tokenmaxing.git
 cd mcp-gw
 cargo build --release
 ```
