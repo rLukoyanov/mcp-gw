@@ -37,7 +37,7 @@ impl Metrics {
 
         let tool_calls = IntCounterVec::new(
             Opts::new(
-                "mcp_gw_tool_calls_total",
+                "tokenmaxing_tool_calls_total",
                 "Calls to upstream tools through call_tool",
             ),
             &["tool", "server", "status"],
@@ -46,7 +46,7 @@ impl Metrics {
 
         let tool_call_duration = HistogramVec::new(
             HistogramOpts::new(
-                "mcp_gw_tool_call_duration_seconds",
+                "tokenmaxing_tool_call_duration_seconds",
                 "Latency of upstream tool calls",
             )
             .buckets(buckets()),
@@ -56,7 +56,7 @@ impl Metrics {
 
         let meta_tool_calls = IntCounterVec::new(
             Opts::new(
-                "mcp_gw_meta_tool_calls_total",
+                "tokenmaxing_meta_tool_calls_total",
                 "Calls to the gateway's own meta-tools",
             ),
             &["tool", "status"],
@@ -65,7 +65,7 @@ impl Metrics {
 
         let catalog_tools = IntGaugeVec::new(
             Opts::new(
-                "mcp_gw_catalog_tools",
+                "tokenmaxing_catalog_tools",
                 "Number of tools in the catalog per upstream server",
             ),
             &["server"],
@@ -74,7 +74,7 @@ impl Metrics {
 
         let servers_connected = IntGaugeVec::new(
             Opts::new(
-                "mcp_gw_servers_connected",
+                "tokenmaxing_servers_connected",
                 "Whether an upstream server is connected (1) or not (0)",
             ),
             &["server"],
@@ -83,7 +83,7 @@ impl Metrics {
 
         let compression = IntCounterVec::new(
             Opts::new(
-                "mcp_gw_compression_total",
+                "tokenmaxing_compression_total",
                 "Result of automatic compression of tool results",
             ),
             &["outcome"],
@@ -92,7 +92,7 @@ impl Metrics {
 
         let code_mode = IntCounterVec::new(
             Opts::new(
-                "mcp_gw_code_mode_executions_total",
+                "tokenmaxing_code_mode_executions_total",
                 "Executions of execute_code by status",
             ),
             &["status"],
@@ -101,7 +101,7 @@ impl Metrics {
 
         let code_mode_duration = Histogram::with_opts(
             HistogramOpts::new(
-                "mcp_gw_code_mode_duration_seconds",
+                "tokenmaxing_code_mode_duration_seconds",
                 "Duration of execute_code runs",
             )
             .buckets(buckets()),
@@ -110,7 +110,7 @@ impl Metrics {
 
         let tool_definition_tokens = IntGaugeVec::new(
             Opts::new(
-                "mcp_gw_tool_definition_tokens",
+                "tokenmaxing_tool_definition_tokens",
                 "Tokenizer counts of all tool definitions per server (direct-client baseline)",
             ),
             &["server"],
@@ -118,38 +118,38 @@ impl Metrics {
         .expect("valid metric");
 
         let meta_definition_tokens = IntGauge::new(
-            "mcp_gw_meta_tool_definition_tokens",
+            "tokenmaxing_meta_tool_definition_tokens",
             "Tokenizer counts of the gateway's own meta-tool definitions",
         )
         .expect("valid metric");
 
         let inspection_tokens = IntCounter::new(
-            "mcp_gw_inspection_tokens_total",
+            "tokenmaxing_inspection_tokens_total",
             "Tokenizer counts of search_tools and get_tool_details responses",
         )
         .expect("valid metric");
 
         let compression_original_tokens = IntCounter::new(
-            "mcp_gw_compression_original_tokens_total",
+            "tokenmaxing_compression_original_tokens_total",
             "Tokens before Headroom compression",
         )
         .expect("valid metric");
 
         let compression_compressed_tokens = IntCounter::new(
-            "mcp_gw_compression_compressed_tokens_total",
+            "tokenmaxing_compression_compressed_tokens_total",
             "Tokens after Headroom compression",
         )
         .expect("valid metric");
 
         let compression_saved_tokens = IntCounter::new(
-            "mcp_gw_compression_saved_tokens_total",
+            "tokenmaxing_compression_saved_tokens_total",
             "Tokens saved by Headroom compression",
         )
         .expect("valid metric");
 
         let tokenizer_info = IntGaugeVec::new(
             Opts::new(
-                "mcp_gw_tokenizer_info",
+                "tokenmaxing_tokenizer_info",
                 "Tokenizer used for real token counts",
             ),
             &["tokenizer"],
@@ -292,11 +292,12 @@ pub fn record_code_mode(status: &str, seconds: f64) {
 fn tokenizer_name() -> &'static str {
     static NAME: OnceLock<String> = OnceLock::new();
     NAME.get_or_init(|| {
-        let value = std::env::var("MCP_GW_TOKENIZER").unwrap_or_else(|_| "o200k_base".to_string());
+        let value =
+            std::env::var("TOKENMAXING_TOKENIZER").unwrap_or_else(|_| "o200k_base".to_string());
         match value.as_str() {
             "o200k_base" | "cl100k_base" | "p50k_base" | "r50k_base" => value,
             other => {
-                eprintln!("metrics: unknown MCP_GW_TOKENIZER '{other}', using o200k_base");
+                eprintln!("metrics: unknown TOKENMAXING_TOKENIZER '{other}', using o200k_base");
                 "o200k_base".to_string()
             }
         }
@@ -312,7 +313,7 @@ fn bpe() -> &'static CoreBPE {
     }
 }
 
-/// Real tokenizer count for the configured encoding (`MCP_GW_TOKENIZER`,
+/// Real tokenizer count for the configured encoding (`TOKENMAXING_TOKENIZER`,
 /// default `o200k_base`). Not chars/4.
 pub fn count_tokens(text: &str) -> u64 {
     if text.is_empty() {
@@ -392,16 +393,17 @@ pub async fn serve_http(addr: SocketAddr) -> std::io::Result<()> {
     }
 }
 
-/// Parse the `MCP_GW_METRICS_ADDR` setting. Returns `None` when disabled.
+/// Parse the `TOKENMAXING_METRICS_ADDR` setting. Returns `None` when disabled.
 pub fn configured_addr() -> Option<SocketAddr> {
-    let value = std::env::var("MCP_GW_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9464".into());
+    let value =
+        std::env::var("TOKENMAXING_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9464".into());
     if value.eq_ignore_ascii_case("off") || value.is_empty() {
         return None;
     }
     match value.parse() {
         Ok(addr) => Some(addr),
         Err(err) => {
-            eprintln!("metrics: invalid MCP_GW_METRICS_ADDR '{value}': {err}");
+            eprintln!("metrics: invalid TOKENMAXING_METRICS_ADDR '{value}': {err}");
             None
         }
     }

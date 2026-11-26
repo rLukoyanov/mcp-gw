@@ -419,7 +419,10 @@ impl GatewayServer {
 impl ServerHandler for GatewayServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mcp-gw", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "tokenmaxing",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions(
                 "Progressive tool discovery gateway. Use search_servers/enable_server to control \
                  which upstream servers are connected, search_tools to find capabilities, \
@@ -455,7 +458,7 @@ fn summarize(entry: &CatalogEntry, detail: &DetailLevel) -> ToolSummary {
 }
 
 fn config_path() -> PathBuf {
-    std::env::var_os("MCP_GW_CONFIG")
+    std::env::var_os("TOKENMAXING_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("mcp.json"))
 }

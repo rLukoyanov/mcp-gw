@@ -30,7 +30,7 @@ impl ClientHandler for UpstreamClient {
     fn get_info(&self) -> ClientConfig {
         ClientConfig::new(
             ClientCapabilities::default(),
-            Implementation::new("mcp-gw", env!("CARGO_PKG_VERSION")),
+            Implementation::new("tokenmaxing", env!("CARGO_PKG_VERSION")),
         )
     }
 

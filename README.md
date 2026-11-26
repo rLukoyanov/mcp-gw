@@ -1,4 +1,4 @@
-# mcp-gw
+# tokenmaxing
 
 MCP-шлюз на Rust: подключается к вашим MCP-серверам и отдаёт модели **прогрессивный
 поиск инструментов** вместо того, чтобы грузить все определения тулов в контекст сразу.
@@ -38,7 +38,7 @@ upstream-серверов, которые запускаются через Node
 
 ```bash
 git clone https://github.com/rLukoyanov/tokenmaxing.git
-cd mcp-gw
+cd tokenmaxing
 cargo build --release
 ```
 
@@ -46,21 +46,21 @@ cargo build --release
 
 | Бинарь | Назначение |
 |--------|-----------|
-| `target/release/mcp-gw` | сам шлюз (MCP-сервер по stdio) |
+| `target/release/tokenmaxing` | сам шлюз (MCP-сервер по stdio) |
 | `target/release/demo_upstream` | демо upstream с тулами `echo` и `ping` |
 | `target/release/demo_headroom` | заглушка Headroom для проверки авто-сжатия |
 
 ### 2. Проверьте за минуту (без сети)
 
-Создайте временный конфиг с демо-сервером. Замените `/ABS/PATH/mcp-gw` на абсолютный
+Создайте временный конфиг с демо-сервером. Замените `/ABS/PATH/tokenmaxing` на абсолютный
 путь к репозиторию:
 
 ```bash
-cat > /tmp/mcp-gw-demo.json <<'EOF'
+cat > /tmp/tokenmaxing-demo.json <<'EOF'
 {
   "mcpServers": {
     "demo": {
-      "command": "/ABS/PATH/mcp-gw/target/release/demo_upstream",
+      "command": "/ABS/PATH/tokenmaxing/target/release/demo_upstream",
       "description": "Echo/ping demo",
       "autoConnect": false
     }
@@ -76,7 +76,7 @@ printf '%s\n' \
 '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
 '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
 '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-| MCP_GW_METRICS_ADDR=off MCP_GW_CONFIG=/tmp/mcp-gw-demo.json ./target/release/mcp-gw
+| TOKENMAXING_METRICS_ADDR=off TOKENMAXING_CONFIG=/tmp/tokenmaxing-demo.json ./target/release/tokenmaxing
 ```
 
 В ответе на `tools/list` будут ровно семь имён:
@@ -105,17 +105,17 @@ get_tool_details, search_servers, search_tools
 ```json
 {
   "mcpServers": {
-    "mcp-gw": {
-      "command": "/abs/path/to/mcp-gw/target/release/mcp-gw",
+    "tokenmaxing": {
+      "command": "/abs/path/to/tokenmaxing/target/release/tokenmaxing",
       "env": {
-        "MCP_GW_CONFIG": "/abs/path/to/mcp.json"
+        "TOKENMAXING_CONFIG": "/abs/path/to/mcp.json"
       }
     }
   }
 }
 ```
 
-- `MCP_GW_CONFIG` указывает на **ваш** файл со списком upstream-серверов. Если не задать,
+- `TOKENMAXING_CONFIG` указывает на **ваш** файл со списком upstream-серверов. Если не задать,
   шлюз ищет `./mcp.json` относительно своего рабочего каталога.
 - Клиент сам запускает шлюз и общается с ним по stdio (JSON-RPC). Вручную в терминале
   его запускать не нужно.
@@ -174,10 +174,10 @@ get_tool_details, search_servers, search_tools
 LLM / MCP client
       │  (stdio, JSON-RPC)
       ▼
-  ┌─────────┐   search_servers / enable_server / disable_server
-  │  mcp-gw │   search_tools / get_tool_details / call_tool
-  │ (server)│   execute_code  ── QuickJS sandbox ── callTool()
-  └────┬────┘
+  ┌─────────────┐   search_servers / enable_server / disable_server
+  │ tokenmaxing │   search_tools / get_tool_details / call_tool
+  │  (server)   │   execute_code  ── QuickJS sandbox ── callTool()
+  └──────┬──────┘
        │  (MCP client, stdio child process или Streamable HTTP)
        ▼
   ваши MCP-серверы (filesystem, github, ...)
@@ -276,13 +276,13 @@ LLM / MCP client
 
 В репозитории лежат два набора ролей, все работают через MCP-шлюз:
 
-- **Claude Code**: `.claude/agents/gw-*.md` — 10 субагентов (researcher, reviewer,
+- **Claude Code**: `.claude/agents/tokenmaxing-*.md` — 10 субагентов (researcher, reviewer,
   planner, debugger, tester, docs-writer, refactorer, security-auditor,
   performance-analyst, release-manager). Claude Code подхватывает их при старте;
   вызов — через делегирование субагентам.
-- **opencode**: `.opencode/agent/gw-*.md` — те же 10 ролей с `mode: subagent`.
+- **opencode**: `.opencode/agent/tokenmaxing-*.md` — те же 10 ролей с `mode: subagent`.
   После добавления файлов перезапустите opencode; субагенты вызываются через
-  инструмент `task` из primary-агента (напрямую `--agent gw-*` нельзя — они subagent).
+  инструмент `task` из primary-агента (напрямую `--agent tokenmaxing-*` нельзя — они subagent).
 
 Промпты инструктируют сначала искать возможности (`search_servers`/`search_tools`),
 читать схему (`get_tool_details`), вызывать (`call_tool`), а для цепочек использовать
@@ -390,7 +390,7 @@ Node/Deno:
   или сжатие не уменьшило число токенов — возвращается исходный результат.
 - Промежуточные вызовы внутри `execute_code` не сжимаются — они и так не попадают
   в контекст. Сжимаются только результаты `call_tool`, которые видит модель.
-- Итог каждого случая виден в метрике `mcp_gw_compression_total{outcome}`:
+- Итог каждого случая виден в метрике `tokenmaxing_compression_total{outcome}`:
   `compressed`, `skipped_small`, `no_gain`, `tool_error`, `no_peer`, `error`,
   `bad_response`.
 
@@ -402,11 +402,11 @@ Node/Deno:
 ```bash
 cargo build
 
-cat > /tmp/mcp-gw-compress.json <<'EOF'
+cat > /tmp/tokenmaxing-compress.json <<'EOF'
 {
   "compression": { "server": "headroom", "minBytes": 20 },
   "mcpServers": {
-    "headroom": { "command": "/ABS/PATH/mcp-gw/target/debug/demo_headroom" },
+    "headroom": { "command": "/ABS/PATH/tokenmaxing/target/debug/demo_headroom" },
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
@@ -435,34 +435,34 @@ Headroom может вернуть `router:noop` (0%) — это нормаль�
 
 ## Метрики
 
-Шлюз отдаёт Prometheus-метрики по HTTP. Адрес задаётся `MCP_GW_METRICS_ADDR`
+Шлюз отдаёт Prometheus-метрики по HTTP. Адрес задаётся `TOKENMAXING_METRICS_ADDR`
 (по умолчанию `127.0.0.1:9464`, значение `off` отключает). Формат — обычный `/metrics`.
 
 ```bash
-MCP_GW_METRICS_ADDR=0.0.0.0:9464 MCP_GW_CONFIG=./mcp.json ./target/release/mcp-gw
-curl -s localhost:9464/metrics | grep mcp_gw_
+TOKENMAXING_METRICS_ADDR=0.0.0.0:9464 TOKENMAXING_CONFIG=./mcp.json ./target/release/tokenmaxing
+curl -s localhost:9464/metrics | grep tokenmaxing_
 ```
 
 | Метрика | Тип | Что показывает |
 |---------|-----|----------------|
-| `mcp_gw_meta_tool_calls_total{tool,status}` | counter | вызовы мета-тулов (`search_tools`, `call_tool`, ...) |
-| `mcp_gw_tool_calls_total{tool,server,status}` | counter | вызовы upstream-тулов |
-| `mcp_gw_tool_call_duration_seconds{tool,server}` | histogram | задержка вызовов upstream |
-| `mcp_gw_code_mode_executions_total{status}` | counter | запуски `execute_code` |
-| `mcp_gw_code_mode_duration_seconds` | histogram | длительность `execute_code` |
-| `mcp_gw_compression_total{outcome}` | counter | итоги авто-сжатия |
-| `mcp_gw_catalog_tools{server}` | gauge | тулов в каталоге по серверу |
-| `mcp_gw_servers_connected{server}` | gauge | 1/0 — подключён ли сервер |
-| `mcp_gw_tool_definition_tokens{server}` | gauge | токены всех определений тулов сервера (baseline «без шлюза») |
-| `mcp_gw_meta_tool_definition_tokens` | gauge | токены 7 мета-тулов шлюза |
-| `mcp_gw_inspection_tokens_total` | counter | токены ответов `search_tools` / `get_tool_details` |
-| `mcp_gw_compression_original_tokens_total` | counter | токены до сжатия Headroom |
-| `mcp_gw_compression_compressed_tokens_total` | counter | токены после сжатия Headroom |
-| `mcp_gw_compression_saved_tokens_total` | counter | сэкономленные токены Headroom |
-| `mcp_gw_tokenizer_info{tokenizer}` | gauge | активная кодировка токенайзера |
+| `tokenmaxing_meta_tool_calls_total{tool,status}` | counter | вызовы мета-тулов (`search_tools`, `call_tool`, ...) |
+| `tokenmaxing_tool_calls_total{tool,server,status}` | counter | вызовы upstream-тулов |
+| `tokenmaxing_tool_call_duration_seconds{tool,server}` | histogram | задержка вызовов upstream |
+| `tokenmaxing_code_mode_executions_total{status}` | counter | запуски `execute_code` |
+| `tokenmaxing_code_mode_duration_seconds` | histogram | длительность `execute_code` |
+| `tokenmaxing_compression_total{outcome}` | counter | итоги авто-сжатия |
+| `tokenmaxing_catalog_tools{server}` | gauge | тулов в каталоге по серверу |
+| `tokenmaxing_servers_connected{server}` | gauge | 1/0 — подключён ли сервер |
+| `tokenmaxing_tool_definition_tokens{server}` | gauge | токены всех определений тулов сервера (baseline «без шлюза») |
+| `tokenmaxing_meta_tool_definition_tokens` | gauge | токены 7 мета-тулов шлюза |
+| `tokenmaxing_inspection_tokens_total` | counter | токены ответов `search_tools` / `get_tool_details` |
+| `tokenmaxing_compression_original_tokens_total` | counter | токены до сжатия Headroom |
+| `tokenmaxing_compression_compressed_tokens_total` | counter | токены после сжатия Headroom |
+| `tokenmaxing_compression_saved_tokens_total` | counter | сэкономленные токены Headroom |
+| `tokenmaxing_tokenizer_info{tokenizer}` | gauge | активная кодировка токенайзера |
 
 Токены считаются **реальным токенайзером tiktoken** (`o200k_base` по умолчанию), а не
-`символы / 4`. Кодировку можно выбрать через `MCP_GW_TOKENIZER`: `o200k_base`,
+`символы / 4`. Кодировку можно выбрать через `TOKENMAXING_TOKENIZER`: `o200k_base`,
 `cl100k_base`, `p50k_base`, `r50k_base`. Для конкретной модели провайдера точные цифры
 даёт A/B-бенчмарк — см. [RESULTS.md](RESULTS.md).
 
@@ -478,10 +478,10 @@ Prometheus/Grafana. Отдельного стека мониторинга в м
 По метрикам на одном и том же каталоге видно, сколько токенов ушло бы на все
 определения тулов при прямом подключении и сколько тратит шлюз:
 
-- direct baseline: `sum(mcp_gw_tool_definition_tokens)`;
-- gateway: `mcp_gw_meta_tool_definition_tokens`;
-- плюс загруженные по требованию схемы: `mcp_gw_inspection_tokens_total`;
-- плюс экономия сжатия: `mcp_gw_compression_saved_tokens_total`.
+- direct baseline: `sum(tokenmaxing_tool_definition_tokens)`;
+- gateway: `tokenmaxing_meta_tool_definition_tokens`;
+- плюс загруженные по требованию схемы: `tokenmaxing_inspection_tokens_total`;
+- плюс экономия сжатия: `tokenmaxing_compression_saved_tokens_total`.
 
 Реальный токенайзер (`o200k_base`), 4 сервера и 42 тула: baseline **19 416** токенов,
 мета-тулы шлюза **1 367** — стартовая экономия **93.0%**. После инспекции двух тулов
@@ -491,7 +491,7 @@ Prometheus/Grafana. Отдельного стека мониторинга в м
 ### 2. Реальный A/B на промптах через LLM
 
 Бенчмарк запускал `opencode run --format json` на одних и тех же промптах дважды:
-с прямым подключением всех серверов и через `mcp-gw`, и сравнивал **реальные токены
+с прямым подключением всех серверов и через `tokenmaxing`, и сравнивал **реальные токены
 провайдера** из событий `step_finish` (total/input/output/cache/cost). Скрипт
 бенчмарка не входит в минимальный репозиторий; зафиксированные артефакты — в `results/`.
 
@@ -521,9 +521,9 @@ cache-hit'ы на свои 47 определений (input падает до 26
 
 | Переменная | По умолчанию | Назначение |
 |------------|--------------|------------|
-| `MCP_GW_CONFIG` | `./mcp.json` | Путь к файлу конфигурации. |
-| `MCP_GW_METRICS_ADDR` | `127.0.0.1:9464` | Адрес HTTP-сервера метрик; `off` или пустая строка отключают. |
-| `MCP_GW_TOKENIZER` | `o200k_base` | Кодировка tiktoken: `o200k_base`, `cl100k_base`, `p50k_base`, `r50k_base`. Неизвестное значение → `o200k_base` с предупреждением. |
+| `TOKENMAXING_CONFIG` | `./mcp.json` | Путь к файлу конфигурации. |
+| `TOKENMAXING_METRICS_ADDR` | `127.0.0.1:9464` | Адрес HTTP-сервера метрик; `off` или пустая строка отключают. |
+| `TOKENMAXING_TOKENIZER` | `o200k_base` | Кодировка tiktoken: `o200k_base`, `cl100k_base`, `p50k_base`, `r50k_base`. Неизвестное значение → `o200k_base` с предупреждением. |
 
 ## Поведение и детали
 
@@ -560,13 +560,13 @@ cache-hit'ы на свои 47 определений (input падает до 26
 
 | Симптом | Вероятная причина | Что делать |
 |---------|-------------------|------------|
-| `warning: reading config ...` и пустой каталог | `MCP_GW_CONFIG` указывает на отсутствующий файл | Проверьте путь; по умолчанию ищется `./mcp.json`. |
+| `warning: reading config ...` и пустой каталог | `TOKENMAXING_CONFIG` указывает на отсутствующий файл | Проверьте путь; по умолчанию ищется `./mcp.json`. |
 | `skipping server 'x': must specify either ...` | В записи нет ровно одного транспорта | Укажите либо `command`, либо `url`. |
 | `failed to connect server 'x'` | Команда не в PATH, нет прав или `npx` не скачал пакет | Запустите `command` вручную; проверьте stderr upstream. |
 | Клиент видит только 7 тулов | Так и задумано | Модель должна вызвать `search_servers`/`search_tools`; вызовы делает клиент. |
 | `enable_server` вернул ошибку `tools/list failed` | Сервер запустился, но не отдал список тулов | Проверьте совместимость и логи upstream. |
-| `metrics: failed to serve on ...` | Порт занят или адрес недоступен | Задайте другой `MCP_GW_METRICS_ADDR` или `off`. |
-| Сжатие не применяется | Результат меньше `minBytes`, сервер не подключён или нет выигрыша в токенах | Посмотрите `mcp_gw_compression_total{outcome}`; уменьшите `minBytes`. |
+| `metrics: failed to serve on ...` | Порт занят или адрес недоступен | Задайте другой `TOKENMAXING_METRICS_ADDR` или `off`. |
+| Сжатие не применяется | Результат меньше `minBytes`, сервер не подключён или нет выигрыша в токенах | Посмотрите `tokenmaxing_compression_total{outcome}`; уменьшите `minBytes`. |
 | `execute_code` упал по таймауту | Скрипт дольше 10 с по умолчанию | Увеличьте `timeout_ms` (макс. 60 000) или сократите число вызовов. |
 | Два тула с одинаковым именем | Коллизия между серверами | Используйте имя с префиксом `server__tool`. |
 
@@ -596,5 +596,5 @@ cargo fmt
 | `src/bin/demo_headroom.rs` | Заглушка Headroom для проверки авто-сжатия. |
 | `results/` | Зафиксированные результаты A/B, Headroom и графики. |
 | `RESULTS.md` | Методика, цифры и выводы. |
-| `.claude/agents/gw-*.md` | 10 субагентов Claude Code. |
-| `.opencode/agent/gw-*.md` | 10 субагентов opencode. |
+| `.claude/agents/tokenmaxing-*.md` | 10 субагентов Claude Code. |
+| `.opencode/agent/tokenmaxing-*.md` | 10 субагентов opencode. |
