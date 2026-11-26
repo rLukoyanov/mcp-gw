@@ -10,37 +10,65 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmcp::{
-    ErrorData, ServerHandler, ServiceExt,
-    handler::server::wrapper::{Json, Parameters},
-    model::{
-        CallToolRequestParams, CallToolResult, Implementation, ServerCapabilities, ServerConfig,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
+    handler::server::{
+        tool::ToolCallContext,
+        wrapper::{Json, Parameters},
     },
-    schemars, tool, tool_handler, tool_router,
+    model::{
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ResultType, ServerCapabilities,
+        ServerConfig, Tool,
+    },
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
     transport::stdio,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use registry::{CatalogEntry, GatewayState};
 
-/// Meta-tools implement the "progressive discovery" pattern: the model first
-/// discovers servers, searches a compact catalog, inspects only the tool it
-/// needs, then executes it. Upstream tool definitions never all enter the
-/// context at once, and servers can be connected or dropped on demand.
+/// How the gateway presents itself to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Expose seven stable meta-tools; upstream definitions are discovered on demand.
+    Discovery,
+    /// Expose upstream tools directly. Best for small catalogs and warm caches.
+    Passthrough,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Mode::Discovery => "discovery",
+            Mode::Passthrough => "passthrough",
+        }
+    }
+}
+
+/// In discovery mode the meta-tools implement the "progressive discovery"
+/// pattern: the model first discovers servers, searches a compact catalog,
+/// inspects only the tool it needs, then executes it. In passthrough mode the
+/// catalog is exposed directly, matching a client connected without a gateway.
 #[derive(Clone)]
 struct GatewayServer {
     state: Arc<GatewayState>,
+    mode: Mode,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum DetailLevel {
-    /// Only the tool name and its server.
-    Name,
-    /// Name, title and one-line description (default).
+    /// Only the tool name and its server (default).
     #[default]
+    Name,
+    /// Name, title and a one-line description.
     Summary,
-    /// Everything, including the input schema.
+    /// The above plus a compact input schema without descriptions or examples.
+    Schema,
+    /// Everything, including the complete input schema.
     Full,
 }
 
@@ -86,7 +114,7 @@ struct SearchToolsParams {
     query: String,
     /// Maximum number of results to return (defaults to 10).
     limit: Option<usize>,
-    /// How much detail to include per result.
+    /// How much detail to include per result (defaults to `name`).
     detail: Option<DetailLevel>,
 }
 
@@ -112,7 +140,9 @@ struct SearchToolsResult {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetToolDetailsParams {
     /// Exact tool name, as returned by `search_tools`.
-    name: String,
+    name: Option<String>,
+    /// Several exact tool names (at most 20). Returns `{ tools, missing }`.
+    names: Option<Vec<String>>,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -144,6 +174,13 @@ struct ExecuteCodeParams {
     /// Execution timeout in milliseconds (default 10000, max 60000).
     timeout_ms: Option<u64>,
 }
+
+/// Descriptions in `summary`/`schema` results are collapsed to one line.
+const SUMMARY_MAX_CHARS: usize = 200;
+/// Upper bound for a single batched `get_tool_details` call.
+const MAX_BATCH_DETAILS: usize = 20;
+/// Default threshold for automatic passthrough mode.
+const DEFAULT_PASSTHROUGH_MAX_TOOLS: usize = 15;
 
 #[tool_router]
 impl GatewayServer {
@@ -253,7 +290,7 @@ impl GatewayServer {
     /// Layer 1 — catalog: search available tools by keyword.
     #[tool(
         name = "search_tools",
-        description = "Search the catalog of tools available through connected servers. Returns matching tool names and the upstream server that provides them, with optional descriptions and schemas."
+        description = "Search the catalog of tools available through connected servers. By default returns only tool names and their server; set detail to `summary` for one-line descriptions, `schema` for compact input schemas, or `full` for complete schemas."
     )]
     fn search_tools(
         &self,
@@ -281,40 +318,66 @@ impl GatewayServer {
         Json(result)
     }
 
-    /// Layer 2 — inspect: fetch the full definition for a single tool.
+    /// Layer 2 — inspect: fetch full definitions for one or several tools.
     #[tool(
         name = "get_tool_details",
-        description = "Get the full definition of one tool by its exact name, including its input and output JSON schemas."
+        description = "Get full definitions (input and output JSON schemas) for one tool via `name`, or up to 20 tools via `names`. Batched calls return `{ tools, missing }`."
     )]
     fn get_tool_details(
         &self,
-        Parameters(GetToolDetailsParams { name }): Parameters<GetToolDetailsParams>,
-    ) -> Result<Json<ToolDetails>, ErrorData> {
-        let entry = self.state.get(&name).ok_or_else(|| {
-            metrics::record_meta_tool("get_tool_details", "error");
-            ErrorData::resource_not_found(
-                format!("tool '{name}' not found; use search_tools first"),
-                None,
-            )
-        })?;
-
-        let tool = &entry.tool;
-        metrics::record_meta_tool("get_tool_details", "ok");
-        let details = ToolDetails {
-            name: entry.name,
-            server: entry.server,
-            title: tool.title.clone(),
-            description: tool.description.as_ref().map(|d| d.to_string()),
-            input_schema: Value::Object((*tool.input_schema).clone()),
-            output_schema: tool
-                .output_schema
-                .as_ref()
-                .map(|schema| Value::Object((**schema).clone())),
-        };
-        metrics::record_inspection_tokens(metrics::count_tokens(
-            &serde_json::to_string(&details).unwrap_or_default(),
-        ));
-        Ok(Json(details))
+        Parameters(GetToolDetailsParams { name, names }): Parameters<GetToolDetailsParams>,
+    ) -> Result<Json<Value>, ErrorData> {
+        match (name, names) {
+            (Some(_), Some(_)) => {
+                metrics::record_meta_tool("get_tool_details", "error");
+                Err(ErrorData::invalid_params(
+                    "provide either 'name' or 'names', not both",
+                    None,
+                ))
+            }
+            (Some(name), None) => {
+                let Some(entry) = self.state.get(&name) else {
+                    metrics::record_meta_tool("get_tool_details", "error");
+                    return Err(ErrorData::resource_not_found(
+                        format!("tool '{name}' not found; use search_tools first"),
+                        None,
+                    ));
+                };
+                let value = serde_json::to_value(build_details(&entry)).unwrap_or(Value::Null);
+                record_inspection(&value);
+                metrics::record_meta_tool("get_tool_details", "ok");
+                Ok(Json(value))
+            }
+            (None, Some(names)) => {
+                if names.is_empty() {
+                    metrics::record_meta_tool("get_tool_details", "error");
+                    return Err(ErrorData::invalid_params("'names' must not be empty", None));
+                }
+                if names.len() > MAX_BATCH_DETAILS {
+                    metrics::record_meta_tool("get_tool_details", "error");
+                    return Err(ErrorData::invalid_params(
+                        format!("at most {MAX_BATCH_DETAILS} names per call"),
+                        None,
+                    ));
+                }
+                let mut tools = Vec::with_capacity(names.len());
+                let mut missing = Vec::new();
+                for name in names {
+                    match self.state.get(&name) {
+                        Some(entry) => tools.push(build_details(&entry)),
+                        None => missing.push(name),
+                    }
+                }
+                let value = json!({ "tools": tools, "missing": missing });
+                record_inspection(&value);
+                metrics::record_meta_tool("get_tool_details", "ok");
+                Ok(Json(value))
+            }
+            (None, None) => {
+                metrics::record_meta_tool("get_tool_details", "error");
+                Err(ErrorData::invalid_params("provide 'name' or 'names'", None))
+            }
+        }
     }
 
     /// Layer 3 — execute: call a tool on its owning upstream server.
@@ -326,68 +389,13 @@ impl GatewayServer {
         &self,
         Parameters(CallToolParams { name, arguments }): Parameters<CallToolParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let started = Instant::now();
-
-        let Some(entry) = self.state.get(&name) else {
-            metrics::record_meta_tool("call_tool", "error");
-            return Err(ErrorData::resource_not_found(
-                format!("tool '{name}' not found; use search_tools first"),
-                None,
-            ));
+        let result = self.forward_call(&name, arguments).await;
+        let status = match &result {
+            Ok(result) if result.is_error != Some(true) => "ok",
+            _ => "error",
         };
-
-        let Some(peer) = self.state.peer(&entry.server) else {
-            metrics::record_meta_tool("call_tool", "error");
-            return Err(ErrorData::internal_error(
-                format!("server '{}' is not connected", entry.server),
-                None,
-            ));
-        };
-
-        let mut request = CallToolRequestParams::new(entry.tool.name.clone());
-        match arguments {
-            None | Some(Value::Null) => {}
-            Some(Value::Object(map)) => request = request.with_arguments(map),
-            Some(_) => {
-                metrics::record_meta_tool("call_tool", "error");
-                return Err(ErrorData::invalid_params(
-                    "arguments must be a JSON object",
-                    None,
-                ));
-            }
-        }
-
-        let result = match peer.call_tool(request).await {
-            Ok(result) => result,
-            Err(err) => {
-                metrics::record_tool_call(
-                    &name,
-                    &entry.server,
-                    "error",
-                    started.elapsed().as_secs_f64(),
-                );
-                metrics::record_meta_tool("call_tool", "error");
-                return Err(ErrorData::internal_error(
-                    format!("upstream call failed: {err}"),
-                    None,
-                ));
-            }
-        };
-
-        let status = if result.is_error == Some(true) {
-            "error"
-        } else {
-            "ok"
-        };
-        metrics::record_tool_call(
-            &name,
-            &entry.server,
-            status,
-            started.elapsed().as_secs_f64(),
-        );
         metrics::record_meta_tool("call_tool", status);
-
-        Ok(compression::compress(&self.state, &entry.server, result).await)
+        result
     }
 
     /// Programmatic tool calling: run model-written JavaScript in a sandbox that
@@ -415,36 +423,165 @@ impl GatewayServer {
     }
 }
 
+impl GatewayServer {
+    /// Route one tool call to its owning upstream server. Shared by the
+    /// `call_tool` meta-tool and passthrough mode.
+    async fn forward_call(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let Some(entry) = self.state.get(name) else {
+            let hint = match self.mode {
+                Mode::Discovery => "; use search_tools first",
+                Mode::Passthrough => "",
+            };
+            return Err(ErrorData::resource_not_found(
+                format!("tool '{name}' not found{hint}"),
+                None,
+            ));
+        };
+
+        let Some(peer) = self.state.peer(&entry.server) else {
+            return Err(ErrorData::internal_error(
+                format!("server '{}' is not connected", entry.server),
+                None,
+            ));
+        };
+
+        let mut request = CallToolRequestParams::new(entry.tool.name.clone());
+        match arguments {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(map)) => request = request.with_arguments(map),
+            Some(_) => {
+                return Err(ErrorData::invalid_params(
+                    "arguments must be a JSON object",
+                    None,
+                ));
+            }
+        }
+
+        let result = match peer.call_tool(request).await {
+            Ok(result) => result,
+            Err(err) => {
+                metrics::record_tool_call(
+                    name,
+                    &entry.server,
+                    "error",
+                    started.elapsed().as_secs_f64(),
+                );
+                return Err(ErrorData::internal_error(
+                    format!("upstream call failed: {err}"),
+                    None,
+                ));
+            }
+        };
+
+        let status = if result.is_error == Some(true) {
+            "error"
+        } else {
+            "ok"
+        };
+        metrics::record_tool_call(name, &entry.server, status, started.elapsed().as_secs_f64());
+        Ok(compression::compress(&self.state, &entry.server, result).await)
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for GatewayServer {
     fn get_info(&self) -> ServerConfig {
+        let instructions = match self.mode {
+            Mode::Discovery => {
+                "Progressive tool discovery gateway. Use search_servers/enable_server to control \
+                 which upstream servers are connected, search_tools to find capabilities (name-only \
+                 by default; ask for summary or schema when needed), get_tool_details to inspect \
+                 one or more schemas, call_tool to invoke one tool, or execute_code to compose \
+                 several calls in a sandbox."
+            }
+            Mode::Passthrough => {
+                "All configured upstream MCP tools are exposed directly. Call them as regular MCP \
+                 tools. Large results may be compressed automatically when compression is configured."
+            }
+        };
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "tokenmaxing",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(
-                "Progressive tool discovery gateway. Use search_servers/enable_server to control \
-                 which upstream servers are connected, search_tools to find capabilities, \
-                 get_tool_details to inspect a tool's schema, call_tool to invoke one tool, or \
-                 execute_code to compose several calls in a sandbox."
-                    .to_string(),
-            )
+            .with_instructions(instructions.to_string())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let tools = match self.mode {
+            Mode::Discovery => Self::tool_router().list_all(),
+            Mode::Passthrough => {
+                self.state.set_client_peer(context.peer.clone());
+                self.state.catalog_tools()
+            }
+        };
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(CacheScope::Public),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        match self.mode {
+            Mode::Discovery => Self::tool_router().get(name).cloned(),
+            Mode::Passthrough => self.state.catalog_tool(name),
+        }
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        match self.mode {
+            Mode::Discovery => {
+                let tcc = ToolCallContext::new(self, request, context);
+                Self::tool_router().call(tcc).await
+            }
+            Mode::Passthrough => {
+                let name = request.name.to_string();
+                let arguments = request.arguments.map(Value::Object);
+                let result = self.forward_call(&name, arguments).await?;
+                Ok(result.into())
+            }
+        }
     }
 }
 
 fn summarize(entry: &CatalogEntry, detail: &DetailLevel) -> ToolSummary {
     let tool = &entry.tool;
+    let description = tool.description.as_ref().map(|d| d.to_string());
     let (title, description, input_schema) = match detail {
         DetailLevel::Name => (None, None, None),
         DetailLevel::Summary => (
             tool.title.clone(),
-            tool.description.as_ref().map(|d| d.to_string()),
+            description.map(|text| one_line(&text, SUMMARY_MAX_CHARS)),
             None,
+        ),
+        DetailLevel::Schema => (
+            tool.title.clone(),
+            description.map(|text| one_line(&text, SUMMARY_MAX_CHARS)),
+            Some(compact_schema(&Value::Object((*tool.input_schema).clone()))),
         ),
         DetailLevel::Full => (
             tool.title.clone(),
-            tool.description.as_ref().map(|d| d.to_string()),
+            description,
             Some(Value::Object((*tool.input_schema).clone())),
         ),
     };
@@ -457,10 +594,132 @@ fn summarize(entry: &CatalogEntry, detail: &DetailLevel) -> ToolSummary {
     }
 }
 
+fn build_details(entry: &CatalogEntry) -> ToolDetails {
+    let tool = &entry.tool;
+    ToolDetails {
+        name: entry.name.clone(),
+        server: entry.server.clone(),
+        title: tool.title.clone(),
+        description: tool.description.as_ref().map(|d| d.to_string()),
+        input_schema: Value::Object((*tool.input_schema).clone()),
+        output_schema: tool
+            .output_schema
+            .as_ref()
+            .map(|schema| Value::Object((**schema).clone())),
+    }
+}
+
+fn record_inspection(value: &Value) {
+    metrics::record_inspection_tokens(metrics::count_tokens(&value.to_string()));
+}
+
+/// Collapse whitespace and truncate to `max_chars` characters.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut truncated: String = collapsed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Keep schema structure and constraints but drop prose that is expensive in
+/// tokens: descriptions, examples, defaults and JSON Schema metadata.
+fn compact_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut compact = serde_json::Map::new();
+            for (key, value) in map {
+                if matches!(
+                    key.as_str(),
+                    "$schema"
+                        | "$id"
+                        | "title"
+                        | "description"
+                        | "examples"
+                        | "default"
+                        | "deprecated"
+                        | "readOnly"
+                        | "writeOnly"
+                        | "externalDocs"
+                ) {
+                    continue;
+                }
+                let value = match key.as_str() {
+                    "properties" => match value {
+                        Value::Object(properties) => Value::Object(
+                            properties
+                                .iter()
+                                .map(|(name, schema)| (name.clone(), compact_schema(schema)))
+                                .collect(),
+                        ),
+                        other => other.clone(),
+                    },
+                    _ => compact_schema(value),
+                };
+                compact.insert(key.clone(), value);
+            }
+            Value::Object(compact)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(compact_schema).collect()),
+        other => other.clone(),
+    }
+}
+
 fn config_path() -> PathBuf {
     std::env::var_os("TOKENMAXING_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("mcp.json"))
+}
+
+/// `TOKENMAXING_MODE`; `auto` (or unset) lets the gateway choose.
+fn mode_from_env() -> Option<Mode> {
+    match std::env::var("TOKENMAXING_MODE").ok().as_deref() {
+        None | Some("") | Some("auto") => None,
+        Some("discovery") => Some(Mode::Discovery),
+        Some("passthrough") => Some(Mode::Passthrough),
+        Some(other) => {
+            eprintln!("mode: unknown TOKENMAXING_MODE '{other}', using auto");
+            None
+        }
+    }
+}
+
+fn passthrough_max_tools() -> usize {
+    match std::env::var("TOKENMAXING_PASSTHROUGH_MAX_TOOLS") {
+        Err(_) => DEFAULT_PASSTHROUGH_MAX_TOOLS,
+        Ok(value) => match value.parse::<usize>() {
+            Ok(parsed) => parsed.clamp(1, 10_000),
+            Err(err) => {
+                eprintln!(
+                    "mode: invalid TOKENMAXING_PASSTHROUGH_MAX_TOOLS '{value}': {err}; \
+                     using {DEFAULT_PASSTHROUGH_MAX_TOOLS}"
+                );
+                DEFAULT_PASSTHROUGH_MAX_TOOLS
+            }
+        },
+    }
+}
+
+/// Automatic mode only chooses passthrough for a small catalog where every
+/// configured server is already connected. Otherwise discovery remains safe.
+fn choose_mode(
+    explicit: Option<Mode>,
+    all_connected: bool,
+    catalog_len: usize,
+    max_tools: usize,
+) -> Mode {
+    explicit.unwrap_or(
+        if all_connected && catalog_len > 0 && catalog_len <= max_tools {
+            Mode::Passthrough
+        } else {
+            Mode::Discovery
+        },
+    )
 }
 
 #[tokio::main]
@@ -478,7 +737,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(GatewayState::new());
 
     let path = config_path();
-    match config::McpConfig::load(&path) {
+    let mode = match config::McpConfig::load(&path) {
         Ok(config) => {
             let (servers, compression) = config.into_parts();
             for server in &servers {
@@ -524,22 +783,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(err) => eprintln!("connection task failed: {err}"),
                 }
             }
-            eprintln!("gateway ready with {} tools", state.len());
+            let all_connected = state.all_configured_connected();
+            let max_tools = passthrough_max_tools();
+            let mode = choose_mode(mode_from_env(), all_connected, state.len(), max_tools);
+            eprintln!(
+                "gateway ready with {} tools (mode: {}, passthrough threshold: {})",
+                state.len(),
+                mode.as_str(),
+                max_tools
+            );
+            if mode == Mode::Passthrough && !all_connected {
+                eprintln!(
+                    "mode: passthrough exposes only connected servers; \
+                     some configured servers are disconnected"
+                );
+            }
+            mode
         }
         Err(err) => {
             eprintln!("warning: {err:#}; starting with an empty tool catalog");
+            Mode::Discovery
         }
-    }
+    };
 
-    let server = GatewayServer { state };
-    let meta_tokens: u64 = GatewayServer::tool_router()
-        .list_all()
-        .iter()
-        .map(|tool| metrics::count_tokens(&serde_json::to_string(tool).unwrap_or_default()))
-        .sum();
-    metrics::set_meta_definition_tokens(meta_tokens);
+    state.set_passthrough(mode == Mode::Passthrough);
+    let server = GatewayServer { state, mode };
+    if mode == Mode::Discovery {
+        let meta_tokens: u64 = GatewayServer::tool_router()
+            .list_all()
+            .iter()
+            .map(|tool| metrics::count_tokens(&serde_json::to_string(tool).unwrap_or_default()))
+            .sum();
+        metrics::set_meta_definition_tokens(meta_tokens);
+    } else {
+        metrics::set_meta_definition_tokens(0);
+    }
 
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_line_collapses_whitespace_and_truncates() {
+        assert_eq!(one_line("  hello\n\n  world  ", 40), "hello world");
+        assert_eq!(one_line("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn compact_schema_keeps_structure_and_drops_prose() {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "title": "Example",
+            "description": "a long description",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "where to read",
+                    "examples": ["/tmp/x"]
+                },
+                "flag": { "type": "boolean", "default": false }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        });
+
+        let compact = compact_schema(&schema);
+        assert!(compact.get("$schema").is_none());
+        assert!(compact.get("title").is_none());
+        assert!(compact.get("description").is_none());
+        assert!(compact["properties"]["path"].get("description").is_none());
+        assert!(compact["properties"]["path"].get("examples").is_none());
+        assert!(compact["properties"]["flag"].get("default").is_none());
+        assert_eq!(compact["properties"]["path"]["type"], "string");
+        assert_eq!(compact["required"], serde_json::json!(["path"]));
+        assert_eq!(compact["additionalProperties"], false);
+    }
+
+    #[test]
+    fn auto_mode_requires_a_small_fully_connected_catalog() {
+        assert_eq!(choose_mode(None, true, 10, 15), Mode::Passthrough);
+        assert_eq!(choose_mode(None, true, 16, 15), Mode::Discovery);
+        assert_eq!(choose_mode(None, false, 10, 15), Mode::Discovery);
+        assert_eq!(choose_mode(None, true, 0, 15), Mode::Discovery);
+        assert_eq!(
+            choose_mode(Some(Mode::Discovery), true, 3, 15),
+            Mode::Discovery
+        );
+        assert_eq!(
+            choose_mode(Some(Mode::Passthrough), false, 3, 15),
+            Mode::Passthrough
+        );
+    }
 }

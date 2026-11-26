@@ -1,6 +1,9 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use rmcp::RoleServer;
 use rmcp::model::Tool;
 use rmcp::service::RunningServiceCancellationToken;
 use rmcp::service::{Peer, RoleClient};
@@ -45,6 +48,11 @@ pub struct GatewayState {
     /// Serializes `enable_server` / `disable_server` so concurrent requests
     /// cannot open or tear down the same connection twice.
     lifecycle: Mutex<()>,
+    /// Passthrough mode exposes catalog tools directly; when enabled, changes
+    /// to the catalog must be announced to the connected client.
+    passthrough: AtomicBool,
+    /// The downstream client, learned from the first `tools/list` request.
+    client_peer: RwLock<Option<Peer<RoleServer>>>,
 }
 
 impl GatewayState {
@@ -103,6 +111,42 @@ impl GatewayState {
         self.peers.read().unwrap().get(server).cloned()
     }
 
+    /// Whether every configured server currently has a live connection.
+    pub fn all_configured_connected(&self) -> bool {
+        let configs = self.configs.read().unwrap();
+        let peers = self.peers.read().unwrap();
+        configs.keys().all(|name| {
+            peers
+                .get(name)
+                .is_some_and(|peer| !peer.is_transport_closed())
+        })
+    }
+
+    pub fn set_passthrough(&self, enabled: bool) {
+        self.passthrough.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Remember the downstream client so upstream tool changes can be relayed.
+    pub fn set_client_peer(&self, peer: Peer<RoleServer>) {
+        *self.client_peer.write().unwrap() = Some(peer);
+    }
+
+    /// Notify the client that `tools/list` changed. Only meaningful in
+    /// passthrough mode, where the exposed tool set follows the catalog.
+    fn notify_tools_changed(&self) {
+        if !self.passthrough.load(Ordering::Relaxed) {
+            return;
+        }
+        let peer = self.client_peer.read().unwrap().clone();
+        if let Some(peer) = peer {
+            tokio::spawn(async move {
+                if let Err(err) = peer.notify_tool_list_changed().await {
+                    eprintln!("failed to notify client about tool list change: {err}");
+                }
+            });
+        }
+    }
+
     /// Tear down a server: cancel its connection and drop its tools.
     /// Returns whether a connection was actually removed.
     pub fn disconnect(&self, server: &str) -> bool {
@@ -117,6 +161,7 @@ impl GatewayState {
         metrics::set_server_connected(server, false);
         metrics::set_catalog_tools(server, 0);
         metrics::set_server_definition_tokens(server, 0);
+        self.notify_tools_changed();
         removed_peer
     }
 
@@ -168,6 +213,21 @@ impl GatewayState {
             })
             .sum();
         metrics::set_server_definition_tokens(server, tokens);
+        drop(catalog);
+        self.notify_tools_changed();
+    }
+
+    /// Tool definitions as the model should see them, with collision-safe names.
+    pub fn catalog_tools(&self) -> Vec<Tool> {
+        let catalog = self.catalog.read().unwrap();
+        let mut tools: Vec<Tool> = catalog.iter().map(exposed_tool).collect();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools
+    }
+
+    /// One catalog tool with its exposed (possibly namespaced) name.
+    pub fn catalog_tool(&self, name: &str) -> Option<Tool> {
+        self.get(name).as_ref().map(exposed_tool)
     }
 
     /// Configured servers matching `query` (by name or description), with their
@@ -250,6 +310,15 @@ impl GatewayState {
     pub fn len(&self) -> usize {
         self.catalog.read().unwrap().len()
     }
+}
+
+/// A clone of the upstream definition under the name exposed to the model.
+fn exposed_tool(entry: &CatalogEntry) -> Tool {
+    let mut tool = entry.tool.clone();
+    if tool.name != entry.name {
+        tool.name = Cow::Owned(entry.name.clone());
+    }
+    tool
 }
 
 fn score_entry(entry: &CatalogEntry, tokens: &[String]) -> u32 {
@@ -367,6 +436,27 @@ mod tests {
 
         assert_eq!(state.servers("demo", 10).len(), 1);
         assert!(state.servers("nothing", 10).is_empty());
+    }
+
+    #[test]
+    fn catalog_tools_use_collision_safe_names() {
+        let state = GatewayState::new();
+        state.replace_server_tools("a", vec![tool("search", "a search")]);
+        state.replace_server_tools("b", vec![tool("search", "b search")]);
+
+        let names: Vec<String> = state
+            .catalog_tools()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(names.contains(&"search".to_string()));
+        assert!(names.contains(&"b__search".to_string()));
+        assert_eq!(
+            state
+                .catalog_tool("b__search")
+                .map(|tool| tool.name.to_string()),
+            Some("b__search".to_string())
+        );
     }
 
     #[test]
