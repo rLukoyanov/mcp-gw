@@ -29,6 +29,10 @@ pub struct Metrics {
     compression_original_tokens: IntCounter,
     compression_compressed_tokens: IntCounter,
     compression_saved_tokens: IntCounter,
+    tool_cache_lookups: IntCounterVec,
+    tool_cache_entries: IntGauge,
+    tool_cache_saved_calls: IntCounter,
+    tool_cache_saved_result_bytes: IntCounter,
 }
 
 impl Metrics {
@@ -147,6 +151,33 @@ impl Metrics {
         )
         .expect("valid metric");
 
+        let tool_cache_lookups = IntCounterVec::new(
+            Opts::new(
+                "tokenmaxing_tool_cache_lookups_total",
+                "Tool result cache lookups by outcome",
+            ),
+            &["result"],
+        )
+        .expect("valid metric");
+
+        let tool_cache_entries = IntGauge::new(
+            "tokenmaxing_tool_cache_entries",
+            "Entries in the tool result cache",
+        )
+        .expect("valid metric");
+
+        let tool_cache_saved_calls = IntCounter::new(
+            "tokenmaxing_tool_cache_saved_calls_total",
+            "Upstream tool calls avoided by tool cache hits",
+        )
+        .expect("valid metric");
+
+        let tool_cache_saved_result_bytes = IntCounter::new(
+            "tokenmaxing_tool_cache_saved_result_bytes_total",
+            "Serialized tool result bytes served from the cache",
+        )
+        .expect("valid metric");
+
         let tokenizer_info = IntGaugeVec::new(
             Opts::new(
                 "tokenmaxing_tokenizer_info",
@@ -200,6 +231,18 @@ impl Metrics {
             .register(Box::new(compression_saved_tokens.clone()))
             .expect("register metric");
         registry
+            .register(Box::new(tool_cache_lookups.clone()))
+            .expect("register metric");
+        registry
+            .register(Box::new(tool_cache_entries.clone()))
+            .expect("register metric");
+        registry
+            .register(Box::new(tool_cache_saved_calls.clone()))
+            .expect("register metric");
+        registry
+            .register(Box::new(tool_cache_saved_result_bytes.clone()))
+            .expect("register metric");
+        registry
             .register(Box::new(tokenizer_info.clone()))
             .expect("register metric");
 
@@ -219,6 +262,10 @@ impl Metrics {
             compression_original_tokens,
             compression_compressed_tokens,
             compression_saved_tokens,
+            tool_cache_lookups,
+            tool_cache_entries,
+            tool_cache_saved_calls,
+            tool_cache_saved_result_bytes,
         }
     }
 }
@@ -273,6 +320,28 @@ pub fn set_server_connected(server: &str, connected: bool) {
             .servers_connected
             .with_label_values(&[server])
             .set(if connected { 1 } else { 0 });
+    }
+}
+
+pub fn record_tool_cache_lookup(result: &str) {
+    if let Some(metrics) = global() {
+        metrics
+            .tool_cache_lookups
+            .with_label_values(&[result])
+            .inc();
+    }
+}
+
+pub fn set_tool_cache_entries(count: usize) {
+    if let Some(metrics) = global() {
+        metrics.tool_cache_entries.set(count as i64);
+    }
+}
+
+pub fn record_tool_cache_saved_call(bytes: usize) {
+    if let Some(metrics) = global() {
+        metrics.tool_cache_saved_calls.inc();
+        metrics.tool_cache_saved_result_bytes.inc_by(bytes as u64);
     }
 }
 

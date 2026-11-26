@@ -12,6 +12,8 @@ MCP-шлюз на Rust: подключается к вашим MCP-сервер�
   только имена.
 - **Кеш использованных тулов**: частые тулы поднимаются в поиске и попадают в
   instructions для повторных задач.
+- **Opt-in кеш результатов тулов**: exact + semantic (эмбеддинги), с allowlist,
+  TTL, персистентностью и метриками.
 - **Сжатие крупных результатов** через Headroom: до −49% на JSON и логах.
 - Два транспорта до upstream (**stdio** и **Streamable HTTP**), песочница **QuickJS**
   для code mode, **Prometheus-метрики**, наборы агентов для Claude Code и opencode.
@@ -173,6 +175,7 @@ get_tool_details, search_servers, search_tools
 - [Конфигурация `mcp.json`](#конфигурация-mcpjson)
 - [Инструменты шлюза](#инструменты-шлюза)
 - [Кеш использованных тулов](#кеш-использованных-тулов)
+- [Кеш результатов тулов](#кеш-результатов-тулов)
 - [Авто-сжатие через Headroom](#авто-сжатие-через-headroom)
 - [Метрики](#метрики)
 - [Экономия токенов](#экономия-токенов)
@@ -429,6 +432,81 @@ Node/Deno:
   сначала вызвать `enable_server`;
 - запись атомарная, хранится не больше 2000 записей; ошибки кеша не ломают вызовы.
 
+## Кеш результатов тулов
+
+Opt-in кеш **результатов** `call_tool` / `callTool` (не путать с кешем использованных
+тулов выше). По умолчанию выключен; включается блоком `toolCache` в `mcp.json`.
+
+```json
+{
+  "toolCache": {
+    "enabled": true,
+    "mode": "semantic",
+    "ttlSeconds": 300,
+    "threshold": 0.9,
+    "maxEntries": 200,
+    "maxResultBytes": 65536,
+    "tools": ["filesystem_read_text_file", "filesystem_list_directory"],
+    "embeddings": {
+      "provider": "ollama",
+      "model": "nomic-embed-text",
+      "url": "http://localhost:11434"
+    }
+  }
+}
+```
+
+| Поле | По умолчанию | Описание |
+|------|--------------|----------|
+| `enabled` | `false` | Включить кеш. |
+| `mode` | `exact` | `exact` — только точные аргументы; `semantic` — exact + поиск по эмбеддингам. |
+| `ttlSeconds` | `300` | Время жизни записи. |
+| `threshold` | `0.9` | Минимальная cosine similarity для semantic-попадания. |
+| `maxEntries` | `200` | Лимит записей; старые вытесняются (LRU). |
+| `maxResultBytes` | `65536` | Результаты больше лимита не кешируются. |
+| `tools` | — | **Обязательный allowlist** имён тулов; поддерживается `*` в конце. Пустой список отключает кеш. |
+| `embeddings` | — | Нужен для `semantic`. |
+| `path` | кеш-директория | Путь к файлу кеша. |
+
+`embeddings`:
+
+| Поле | Описание |
+|------|----------|
+| `provider` | `openai` (OpenAI-совместимый), `ollama` или `hash` (лексический оффлайн-провайдер для тестов). |
+| `model` | Модель; обязательна для `openai`/`ollama`. |
+| `url` | База OpenAI (`https://api.openai.com/v1`) или Ollama (`http://localhost:11434`). |
+| `apiKey` | Ключ; fallback — `TOKENMAXING_EMBEDDINGS_API_KEY`. |
+| `dimensions` | Размерность для `hash` (по умолчанию 256). |
+| `timeoutMs` | Таймаут HTTP-запроса (по умолчанию 5000). |
+
+Как работает:
+
+- exact-ключ = тул + сервер + fingerprint определения + канонизированные аргументы;
+- при промахе exact и `mode: semantic` считается эмбеддинг нормализованного текста
+  аргументов; сравниваются только записи того же тула/сервера/fingerprint;
+- fingerprint меняется при изменении схемы тула, а при `list_changed`/`disable_server`
+  кеш сервера очищается;
+- кешируются только успешные результаты не больше `maxResultBytes`;
+- запись персистентная, атомарная, с правами `0600`; TTL и LRU-вытеснение;
+- результаты из кеша проходят обычное авто-сжатие Headroom (если оно включено);
+- учитываются вызовы из `call_tool`, passthrough и `callTool` внутри `execute_code`;
+- имена в `tools` — те, что видит модель (при коллизии это `server__tool`).
+
+> **Что экономит:** кеш убирает повторный **upstream-вызов** и latency, но возвращает
+> тот же результат — **токены контекста не уменьшаются**. Для экономии контекста
+> используйте Headroom; компактный cache-hit с retrieve — возможное следующее расширение.
+
+> **Безопасность:** включайте в `tools` только read-only/идемпотентные тулы. Не
+> кешируйте `write`/`delete`/платежи. Semantic-поиск может вернуть результат для
+> похожего, но не идентичного запроса — проверяйте TTL и инвалидацию. Файл кеша
+> содержит результаты тулов (возможно, чувствительные), поэтому он пишется с `0600`;
+> путь по умолчанию привязан к конфигу.
+
+Метрики: `tokenmaxing_tool_cache_lookups_total{result}` (`hit_exact`, `hit_semantic`,
+`miss`, `bypass`, `error`), `tokenmaxing_tool_cache_entries`,
+`tokenmaxing_tool_cache_saved_calls_total`,
+`tokenmaxing_tool_cache_saved_result_bytes_total`.
+
 ## Авто-сжатие через Headroom
 
 Если указан блок `compression`, каждый результат `call_tool` крупнее `minBytes`
@@ -542,6 +620,10 @@ curl -s localhost:9464/metrics | grep tokenmaxing_
 | `tokenmaxing_compression_original_tokens_total` | counter | токены до сжатия Headroom |
 | `tokenmaxing_compression_compressed_tokens_total` | counter | токены после сжатия Headroom |
 | `tokenmaxing_compression_saved_tokens_total` | counter | сэкономленные токены Headroom |
+| `tokenmaxing_tool_cache_lookups_total{result}` | counter | lookup'ы кеша результатов: `hit_exact`, `hit_semantic`, `miss`, `bypass`, `error` |
+| `tokenmaxing_tool_cache_entries` | gauge | записей в кеше результатов |
+| `tokenmaxing_tool_cache_saved_calls_total` | counter | upstream-вызовы, предотвращённые кешем |
+| `tokenmaxing_tool_cache_saved_result_bytes_total` | counter | байты результатов, отданные из кеша |
 | `tokenmaxing_tokenizer_info{tokenizer}` | gauge | активная кодировка токенайзера |
 
 Токены считаются **реальным токенайзером tiktoken** (`o200k_base` по умолчанию), а не
@@ -626,6 +708,8 @@ everything). Полная таблица: `results/ab_tokens_table.md`, граф
 | `TOKENMAXING_MODE` | `auto` | `auto`, `discovery` или `passthrough`. |
 | `TOKENMAXING_PASSTHROUGH_MAX_TOOLS` | `20` | Верхняя граница каталога для auto-passthrough (1–10 000). |
 | `TOKENMAXING_CACHE` | `$XDG_CACHE_HOME/tokenmaxing/usage-<hash>.json` | Путь к кешу использованных тулов; `off` отключает. |
+| `TOKENMAXING_TOOL_CACHE` | `$XDG_CACHE_HOME/tokenmaxing/tool-cache-<hash>.json` | Путь к кешу результатов тулов; `off` отключает. |
+| `TOKENMAXING_EMBEDDINGS_API_KEY` | — | Fallback для `toolCache.embeddings.apiKey`. |
 | `TOKENMAXING_METRICS_ADDR` | `127.0.0.1:9464` | Адрес HTTP-сервера метрик; `off` или пустая строка отключают. |
 | `TOKENMAXING_TOKENIZER` | `o200k_base` | Кодировка tiktoken: `o200k_base`, `cl100k_base`, `p50k_base`, `r50k_base`. Неизвестное значение → `o200k_base` с предупреждением. |
 
@@ -663,6 +747,10 @@ everything). Полная таблица: `results/ab_tokens_table.md`, граф
 - Метрики-сервер минимальный: отдаёт `/metrics` по HTTP без аутентификации.
 - В passthrough нет мета-тулов и code mode, а ленивые (`autoConnect: false`) серверы
   не подключаются. Для них используйте discovery.
+- Кеш результатов тулов выключен по умолчанию, требует явного allowlist и не
+  кеширует ошибки/результаты больше `maxResultBytes`. Semantic-провайдер `hash` —
+  лексический, не настоящий semantic; для реального смысла нужны OpenAI/Ollama.
+- Кеш результатов не уменьшает токены контекста — только повторные upstream-вызовы.
 - В минимальной поставке нет Dockerfile, Makefile и готового `mcp.json` — только
   Cargo-сборка и ваш конфиг.
 
@@ -704,6 +792,8 @@ cargo fmt
 | `src/upstream.rs` | MCP-клиент к upstream, `enable`/`disable`, `list_changed`. |
 | `src/compression.rs` | Авто-сжатие результатов через `headroom_compress`. |
 | `src/code_mode.rs` | Песочница QuickJS и брокер `callTool`. |
+| `src/cache.rs` | Кеш использованных тулов и hot hints. |
+| `src/tool_cache.rs` | Exact/semantic кеш результатов тулов и эмбеддинги. |
 | `src/metrics.rs` | Prometheus-метрики, tiktoken и HTTP-экспорт. |
 | `src/bin/demo_upstream.rs` | Демо upstream-сервер для тестов. |
 | `src/bin/demo_headroom.rs` | Заглушка Headroom для проверки авто-сжатия. |

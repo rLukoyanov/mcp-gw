@@ -38,6 +38,7 @@ impl ClientHandler for UpstreamClient {
         match context.peer.list_all_tools().await {
             Ok(tools) => {
                 let count = tools.len();
+                self.state.clear_tool_cache_server(&self.server);
                 self.state.replace_server_tools(&self.server, tools);
                 eprintln!("server '{}': refreshed {count} tools", self.server);
             }

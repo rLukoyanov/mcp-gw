@@ -41,6 +41,8 @@ pub struct McpConfig {
     pub servers: HashMap<String, RawServer>,
     #[serde(default)]
     pub compression: Option<CompressionSettings>,
+    #[serde(rename = "toolCache", default)]
+    pub tool_cache: Option<ToolCacheSettings>,
 }
 
 /// Auto-compression via an upstream MCP server (Headroom).
@@ -72,6 +74,96 @@ fn default_compress_tool() -> String {
 
 fn default_retrieve_tool() -> String {
     "headroom_retrieve".to_string()
+}
+
+/// Optional cache for MCP tool results. Disabled by default and restricted to
+/// an explicit allowlist, because tool calls can have side effects.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolCacheSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: ToolCacheMode,
+    /// Cache entry lifetime in seconds.
+    #[serde(rename = "ttlSeconds", default = "default_tool_cache_ttl")]
+    pub ttl_seconds: u64,
+    /// Cosine similarity required for a semantic hit.
+    #[serde(default = "default_tool_cache_threshold")]
+    pub threshold: f32,
+    #[serde(rename = "maxEntries", default = "default_tool_cache_entries")]
+    pub max_entries: usize,
+    #[serde(rename = "maxResultBytes", default = "default_tool_cache_result_bytes")]
+    pub max_result_bytes: usize,
+    /// Exposed tool names to cache. Supports a trailing `*` wildcard.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub embeddings: Option<EmbeddingSettings>,
+    /// Cache file path; defaults to the user cache directory.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCacheMode {
+    /// Exact canonical arguments only.
+    #[default]
+    Exact,
+    /// Exact first, then embedding similarity within the same tool.
+    Semantic,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingSettings {
+    pub provider: EmbeddingProvider,
+    /// Model name for OpenAI-compatible and Ollama providers.
+    #[serde(default)]
+    pub model: String,
+    /// Base URL (OpenAI) or Ollama base URL.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// API key; `TOKENMAXING_EMBEDDINGS_API_KEY` is used as a fallback.
+    #[serde(rename = "apiKey", default)]
+    pub api_key: Option<String>,
+    /// Dimensions for the local `hash` provider.
+    #[serde(default = "default_hash_dimensions")]
+    pub dimensions: usize,
+    #[serde(rename = "timeoutMs", default = "default_embedding_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingProvider {
+    Openai,
+    Ollama,
+    /// Deterministic token-hash embedding for tests/offline; lexical, not semantic.
+    Hash,
+}
+
+fn default_tool_cache_ttl() -> u64 {
+    300
+}
+
+fn default_tool_cache_threshold() -> f32 {
+    0.9
+}
+
+fn default_tool_cache_entries() -> usize {
+    200
+}
+
+fn default_tool_cache_result_bytes() -> usize {
+    65_536
+}
+
+fn default_hash_dimensions() -> usize {
+    256
+}
+
+fn default_embedding_timeout_ms() -> u64 {
+    5_000
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -106,8 +198,15 @@ impl McpConfig {
 
     /// Convert raw entries into validated server configs, logging and skipping
     /// any entry that does not describe exactly one transport.
-    pub fn into_parts(self) -> (Vec<ServerConfig>, Option<CompressionSettings>) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<ServerConfig>,
+        Option<CompressionSettings>,
+        Option<ToolCacheSettings>,
+    ) {
         let compression = self.compression;
+        let tool_cache = self.tool_cache;
         let servers = self
             .servers
             .into_iter()
@@ -121,7 +220,7 @@ impl McpConfig {
                 },
             )
             .collect();
-        (servers, compression)
+        (servers, compression, tool_cache)
     }
 
     /// Convenience for tests that do not care about compression settings.
@@ -229,7 +328,7 @@ mod tests {
                 "mcpServers": {}
             }"#,
         );
-        let (_, compression) = config.into_parts();
+        let (_, compression, _) = config.into_parts();
         let compression = compression.expect("compression block");
         assert_eq!(compression.server, "headroom");
         assert_eq!(compression.min_bytes, 512);
@@ -252,11 +351,61 @@ mod tests {
                 "mcpServers": {}
             }"#,
         );
-        let (_, compression) = config.into_parts();
+        let (_, compression, _) = config.into_parts();
         let compression = compression.expect("compression block");
         assert_eq!(compression.min_bytes, 10);
         assert!(!compression.enabled);
         assert_eq!(compression.compress_tool, "c");
         assert_eq!(compression.retrieve_tool, "r");
+    }
+
+    #[test]
+    fn parses_tool_cache_defaults() {
+        let config = parse(
+            r#"{
+                "toolCache": {
+                    "enabled": true,
+                    "tools": ["filesystem_read_text_file"]
+                },
+                "mcpServers": {}
+            }"#,
+        );
+        let (_, _, cache) = config.into_parts();
+        let cache = cache.expect("tool cache block");
+        assert!(cache.enabled);
+        assert_eq!(cache.mode, ToolCacheMode::Exact);
+        assert_eq!(cache.ttl_seconds, 300);
+        assert_eq!(cache.max_entries, 200);
+        assert_eq!(cache.max_result_bytes, 65_536);
+        assert_eq!(cache.tools, vec!["filesystem_read_text_file"]);
+        assert!(cache.embeddings.is_none());
+    }
+
+    #[test]
+    fn parses_semantic_tool_cache() {
+        let config = parse(
+            r#"{
+                "toolCache": {
+                    "enabled": true,
+                    "mode": "semantic",
+                    "threshold": 0.8,
+                    "tools": ["*"],
+                    "embeddings": {
+                        "provider": "ollama",
+                        "model": "nomic-embed-text",
+                        "url": "http://localhost:11434"
+                    }
+                },
+                "mcpServers": {}
+            }"#,
+        );
+        let (_, _, cache) = config.into_parts();
+        let cache = cache.expect("tool cache block");
+        assert_eq!(cache.mode, ToolCacheMode::Semantic);
+        assert_eq!(cache.threshold, 0.8);
+        let embeddings = cache.embeddings.expect("embeddings block");
+        assert_eq!(embeddings.provider, EmbeddingProvider::Ollama);
+        assert_eq!(embeddings.model, "nomic-embed-text");
+        assert_eq!(embeddings.timeout_ms, 5_000);
     }
 }

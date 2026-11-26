@@ -4,14 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex as StdMutex, RwLock};
 
 use rmcp::RoleServer;
-use rmcp::model::Tool;
+use rmcp::model::{CallToolResult, Tool};
 use rmcp::service::RunningServiceCancellationToken;
 use rmcp::service::{Peer, RoleClient};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::cache::{HotTool, UsageCache};
 use crate::config::{CompressionSettings, ServerConfig};
 use crate::metrics;
+use crate::tool_cache::{CacheLookup, HitKind, StoreContext, ToolCache, tool_fingerprint};
 
 /// One tool aggregated from an upstream MCP server.
 #[derive(Clone)]
@@ -56,6 +58,8 @@ pub struct GatewayState {
     client_peer: RwLock<Option<Peer<RoleServer>>>,
     /// Tools the model has called, persisted across sessions.
     usage: StdMutex<UsageCache>,
+    /// Exact/semantic cache of tool results (opt-in via config).
+    tool_cache: StdMutex<Option<ToolCache>>,
 }
 
 impl GatewayState {
@@ -142,6 +146,92 @@ impl GatewayState {
         self.usage.lock().unwrap().hot(limit)
     }
 
+    pub fn set_tool_cache(&self, cache: Option<ToolCache>) {
+        *self.tool_cache.lock().unwrap() = cache;
+    }
+
+    /// Exact-first tool result lookup, then semantic if configured. The lock is
+    /// released while an embedding request is in flight.
+    pub async fn cache_lookup(&self, entry: &CatalogEntry, args: &Value) -> CacheLookup {
+        let fingerprint = tool_fingerprint(&entry.tool);
+        let (key, text, embedder, semantic) = {
+            let mut guard = self.tool_cache.lock().unwrap();
+            let Some(cache) = guard.as_mut() else {
+                return CacheLookup::default();
+            };
+            if !cache.allows(&entry.name) {
+                metrics::record_tool_cache_lookup("bypass");
+                return CacheLookup::default();
+            }
+            let key = cache.exact_key(&entry.name, &entry.server, &fingerprint, args);
+            if let Some(hit) = cache.exact_lookup(&entry.name, &entry.server, &fingerprint, &key) {
+                metrics::record_tool_cache_lookup(hit_label(hit.kind));
+                metrics::record_tool_cache_saved_call(result_bytes(&hit.result));
+                return CacheLookup {
+                    hit: Some(hit),
+                    store: None,
+                };
+            }
+            let text = cache.text(&entry.name, &entry.server, args);
+            (key, text, cache.embedder(), cache.semantic())
+        };
+
+        let mut embedding = None;
+        if semantic && let Some(embedder) = embedder {
+            match embedder.embed(&text).await {
+                Ok(vector) => embedding = Some(vector),
+                Err(err) => {
+                    metrics::record_tool_cache_lookup("error");
+                    eprintln!("tool cache: embedding failed: {err:#}; exact cache only");
+                }
+            }
+        }
+
+        let mut guard = self.tool_cache.lock().unwrap();
+        let Some(cache) = guard.as_mut() else {
+            return CacheLookup::default();
+        };
+        if let Some(embedding) = &embedding
+            && let Some(hit) =
+                cache.semantic_lookup(&entry.name, &entry.server, &fingerprint, embedding)
+        {
+            metrics::record_tool_cache_lookup(hit_label(hit.kind));
+            metrics::record_tool_cache_saved_call(result_bytes(&hit.result));
+            return CacheLookup {
+                hit: Some(hit),
+                store: None,
+            };
+        }
+        metrics::record_tool_cache_lookup("miss");
+        CacheLookup {
+            hit: None,
+            store: Some(StoreContext {
+                exact_key: key,
+                fingerprint,
+                embedding,
+            }),
+        }
+    }
+
+    pub fn cache_store(
+        &self,
+        entry: &CatalogEntry,
+        context: StoreContext,
+        result: &CallToolResult,
+    ) {
+        let mut guard = self.tool_cache.lock().unwrap();
+        if let Some(cache) = guard.as_mut() {
+            cache.store(&entry.name, &entry.server, context, result);
+        }
+    }
+
+    pub fn clear_tool_cache_server(&self, server: &str) {
+        let mut guard = self.tool_cache.lock().unwrap();
+        if let Some(cache) = guard.as_mut() {
+            cache.clear_server(server);
+        }
+    }
+
     /// Remember the downstream client so upstream tool changes can be relayed.
     pub fn set_client_peer(&self, peer: Peer<RoleServer>) {
         *self.client_peer.write().unwrap() = Some(peer);
@@ -177,6 +267,7 @@ impl GatewayState {
         metrics::set_server_connected(server, false);
         metrics::set_catalog_tools(server, 0);
         metrics::set_server_definition_tokens(server, 0);
+        self.clear_tool_cache_server(server);
         self.notify_tools_changed();
         removed_peer
     }
@@ -331,6 +422,19 @@ impl GatewayState {
 
     pub fn len(&self) -> usize {
         self.catalog.read().unwrap().len()
+    }
+}
+
+fn result_bytes(result: &CallToolResult) -> usize {
+    serde_json::to_vec(result)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
+fn hit_label(kind: HitKind) -> &'static str {
+    match kind {
+        HitKind::Exact => "hit_exact",
+        HitKind::Semantic => "hit_semantic",
     }
 }
 

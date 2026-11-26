@@ -5,6 +5,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rquickjs::{AsyncContext, AsyncRuntime, Function, Promise, function::Async};
 use serde_json::{Value, json};
 
+use crate::metrics;
 use crate::registry::GatewayState;
 
 /// JavaScript prelude installed before the model's code runs.
@@ -195,19 +196,65 @@ async fn call_upstream(state: &GatewayState, name: &str, args_json: &str) -> Str
         .to_string();
     };
 
+    let arguments = match serde_json::from_str::<Value>(args_json) {
+        Ok(Value::Object(arguments)) => arguments,
+        _ => serde_json::Map::new(),
+    };
     let mut request = CallToolRequestParams::new(entry.tool.name.clone());
-    if let Ok(Value::Object(arguments)) = serde_json::from_str::<Value>(args_json) {
-        request = request.with_arguments(arguments);
+    if !arguments.is_empty() {
+        request = request.with_arguments(arguments.clone());
+    }
+    let cache_args = Value::Object(arguments);
+    let cache = state.cache_lookup(&entry, &cache_args).await;
+    if let Some(hit) = cache.hit {
+        state.record_tool_use(&entry);
+        return match serde_json::to_value(&hit.result) {
+            Ok(value) => json!({ "ok": true, "result": value }).to_string(),
+            Err(err) => json!({
+                "ok": false,
+                "error": format!("failed to serialize cached tool result: {err}"),
+            })
+            .to_string(),
+        };
     }
 
-    match peer.call_tool(request).await {
-        Ok(result) if result.is_error == Some(true) => json!({
+    let started = Instant::now();
+    let result = match peer.call_tool(request).await {
+        Ok(result) => {
+            let status = if result.is_error == Some(true) {
+                "error"
+            } else {
+                "ok"
+            };
+            metrics::record_tool_call(name, &entry.server, status, started.elapsed().as_secs_f64());
+            result
+        }
+        Err(err) => {
+            metrics::record_tool_call(
+                name,
+                &entry.server,
+                "error",
+                started.elapsed().as_secs_f64(),
+            );
+            return json!({
+                "ok": false,
+                "error": format!("upstream call failed: {err}"),
+            })
+            .to_string();
+        }
+    };
+
+    match result {
+        result if result.is_error == Some(true) => json!({
             "ok": false,
             "error": tool_error_text(&result),
         })
         .to_string(),
-        Ok(result) => {
+        result => {
             state.record_tool_use(&entry);
+            if let Some(context) = cache.store {
+                state.cache_store(&entry, context, &result);
+            }
             match serde_json::to_value(&result) {
                 Ok(value) => json!({ "ok": true, "result": value }).to_string(),
                 Err(err) => json!({
@@ -217,11 +264,6 @@ async fn call_upstream(state: &GatewayState, name: &str, args_json: &str) -> Str
                 .to_string(),
             }
         }
-        Err(err) => json!({
-            "ok": false,
-            "error": format!("upstream call failed: {err}"),
-        })
-        .to_string(),
     }
 }
 

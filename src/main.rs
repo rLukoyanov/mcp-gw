@@ -4,6 +4,7 @@ mod compression;
 mod config;
 mod metrics;
 mod registry;
+mod tool_cache;
 mod upstream;
 
 use std::path::PathBuf;
@@ -480,6 +481,16 @@ impl GatewayServer {
             }
         }
 
+        let cache_args = match &request.arguments {
+            Some(arguments) => Value::Object(arguments.clone()),
+            None => Value::Object(Default::default()),
+        };
+        let cache = self.state.cache_lookup(&entry, &cache_args).await;
+        if let Some(hit) = cache.hit {
+            self.state.record_tool_use(&entry);
+            return Ok(compression::compress(&self.state, &entry.server, hit.result).await);
+        }
+
         let result = match peer.call_tool(request).await {
             Ok(result) => result,
             Err(err) => {
@@ -504,6 +515,9 @@ impl GatewayServer {
         metrics::record_tool_call(name, &entry.server, status, started.elapsed().as_secs_f64());
         if status == "ok" {
             self.state.record_tool_use(&entry);
+            if let Some(context) = cache.store {
+                self.state.cache_store(&entry, context, &result);
+            }
         }
         Ok(compression::compress(&self.state, &entry.server, result).await)
     }
@@ -821,7 +835,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.set_usage(cache::UsageCache::from_env(&path));
     let mode = match config::McpConfig::load(&path) {
         Ok(config) => {
-            let (servers, compression) = config.into_parts();
+            let (servers, compression, tool_cache) = config.into_parts();
             for server in &servers {
                 state.register_config(server.clone());
                 metrics::set_server_connected(&server.name, false);
@@ -836,6 +850,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "compression: server '{}' is not configured; auto-compression disabled",
                         settings.server
                     );
+                }
+            }
+
+            if let Some(settings) = tool_cache
+                && settings.enabled
+            {
+                match tool_cache::ToolCache::from_settings(settings, &path) {
+                    Ok(cache) => state.set_tool_cache(Some(cache)),
+                    Err(err) => eprintln!("tool cache: {err:#}; disabled"),
                 }
             }
 
