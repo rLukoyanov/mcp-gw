@@ -1,12 +1,13 @@
 mod code_mode;
 mod compression;
 mod config;
+mod metrics;
 mod registry;
 mod upstream;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
@@ -168,6 +169,7 @@ impl GatewayServer {
                 tool_count: server.tool_count,
             })
             .collect();
+        metrics::record_meta_tool("search_servers", "ok");
         Json(SearchServersResult {
             query,
             total: servers.len(),
@@ -184,12 +186,17 @@ impl GatewayServer {
         &self,
         Parameters(ServerActionParams { name }): Parameters<ServerActionParams>,
     ) -> Result<Json<ServerStatus>, ErrorData> {
-        let config = self.state.config(&name).ok_or_else(|| {
-            ErrorData::resource_not_found(format!("server '{name}' is not configured"), None)
-        })?;
+        let Some(config) = self.state.config(&name) else {
+            metrics::record_meta_tool("enable_server", "error");
+            return Err(ErrorData::resource_not_found(
+                format!("server '{name}' is not configured"),
+                None,
+            ));
+        };
 
         let _guard = self.state.lifecycle().lock().await;
         if self.state.is_connected(&name) {
+            metrics::record_meta_tool("enable_server", "ok");
             return Ok(Json(ServerStatus {
                 name,
                 connected: true,
@@ -197,15 +204,18 @@ impl GatewayServer {
             }));
         }
 
-        let tool_count = upstream::enable(&config, self.state.clone())
-            .await
-            .map_err(|err| {
-                ErrorData::internal_error(
+        let tool_count = match upstream::enable(&config, self.state.clone()).await {
+            Ok(count) => count,
+            Err(err) => {
+                metrics::record_meta_tool("enable_server", "error");
+                return Err(ErrorData::internal_error(
                     format!("failed to enable server '{name}': {err:#}"),
                     None,
-                )
-            })?;
+                ));
+            }
+        };
 
+        metrics::record_meta_tool("enable_server", "ok");
         Ok(Json(ServerStatus {
             name,
             connected: true,
@@ -223,6 +233,7 @@ impl GatewayServer {
         Parameters(ServerActionParams { name }): Parameters<ServerActionParams>,
     ) -> Result<Json<ServerStatus>, ErrorData> {
         if self.state.config(&name).is_none() {
+            metrics::record_meta_tool("disable_server", "error");
             return Err(ErrorData::resource_not_found(
                 format!("server '{name}' is not configured"),
                 None,
@@ -231,6 +242,7 @@ impl GatewayServer {
 
         let _guard = self.state.lifecycle().lock().await;
         self.state.disconnect(&name);
+        metrics::record_meta_tool("disable_server", "ok");
         Ok(Json(ServerStatus {
             name,
             connected: false,
@@ -254,14 +266,19 @@ impl GatewayServer {
         let detail = detail.unwrap_or_default();
         let limit = limit.unwrap_or(10).clamp(1, 50);
         let matches = self.state.search(&query, limit);
-        Json(SearchToolsResult {
+        metrics::record_meta_tool("search_tools", "ok");
+        let result = SearchToolsResult {
             query,
             total: matches.len(),
             tools: matches
                 .into_iter()
                 .map(|entry| summarize(&entry, &detail))
                 .collect(),
-        })
+        };
+        metrics::record_inspection_tokens(metrics::count_tokens(
+            &serde_json::to_string(&result).unwrap_or_default(),
+        ));
+        Json(result)
     }
 
     /// Layer 2 — inspect: fetch the full definition for a single tool.
@@ -274,6 +291,7 @@ impl GatewayServer {
         Parameters(GetToolDetailsParams { name }): Parameters<GetToolDetailsParams>,
     ) -> Result<Json<ToolDetails>, ErrorData> {
         let entry = self.state.get(&name).ok_or_else(|| {
+            metrics::record_meta_tool("get_tool_details", "error");
             ErrorData::resource_not_found(
                 format!("tool '{name}' not found; use search_tools first"),
                 None,
@@ -281,7 +299,8 @@ impl GatewayServer {
         })?;
 
         let tool = &entry.tool;
-        Ok(Json(ToolDetails {
+        metrics::record_meta_tool("get_tool_details", "ok");
+        let details = ToolDetails {
             name: entry.name,
             server: entry.server,
             title: tool.title.clone(),
@@ -291,7 +310,11 @@ impl GatewayServer {
                 .output_schema
                 .as_ref()
                 .map(|schema| Value::Object((**schema).clone())),
-        }))
+        };
+        metrics::record_inspection_tokens(metrics::count_tokens(
+            &serde_json::to_string(&details).unwrap_or_default(),
+        ));
+        Ok(Json(details))
     }
 
     /// Layer 3 — execute: call a tool on its owning upstream server.
@@ -303,22 +326,30 @@ impl GatewayServer {
         &self,
         Parameters(CallToolParams { name, arguments }): Parameters<CallToolParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let entry = self.state.get(&name).ok_or_else(|| {
-            ErrorData::resource_not_found(
+        let started = Instant::now();
+
+        let Some(entry) = self.state.get(&name) else {
+            metrics::record_meta_tool("call_tool", "error");
+            return Err(ErrorData::resource_not_found(
                 format!("tool '{name}' not found; use search_tools first"),
                 None,
-            )
-        })?;
+            ));
+        };
 
-        let peer = self.state.peer(&entry.server).ok_or_else(|| {
-            ErrorData::internal_error(format!("server '{}' is not connected", entry.server), None)
-        })?;
+        let Some(peer) = self.state.peer(&entry.server) else {
+            metrics::record_meta_tool("call_tool", "error");
+            return Err(ErrorData::internal_error(
+                format!("server '{}' is not connected", entry.server),
+                None,
+            ));
+        };
 
         let mut request = CallToolRequestParams::new(entry.tool.name.clone());
         match arguments {
             None | Some(Value::Null) => {}
             Some(Value::Object(map)) => request = request.with_arguments(map),
             Some(_) => {
+                metrics::record_meta_tool("call_tool", "error");
                 return Err(ErrorData::invalid_params(
                     "arguments must be a JSON object",
                     None,
@@ -326,9 +357,35 @@ impl GatewayServer {
             }
         }
 
-        let result = peer.call_tool(request).await.map_err(|err| {
-            ErrorData::internal_error(format!("upstream call failed: {err}"), None)
-        })?;
+        let result = match peer.call_tool(request).await {
+            Ok(result) => result,
+            Err(err) => {
+                metrics::record_tool_call(
+                    &name,
+                    &entry.server,
+                    "error",
+                    started.elapsed().as_secs_f64(),
+                );
+                metrics::record_meta_tool("call_tool", "error");
+                return Err(ErrorData::internal_error(
+                    format!("upstream call failed: {err}"),
+                    None,
+                ));
+            }
+        };
+
+        let status = if result.is_error == Some(true) {
+            "error"
+        } else {
+            "ok"
+        };
+        metrics::record_tool_call(
+            &name,
+            &entry.server,
+            status,
+            started.elapsed().as_secs_f64(),
+        );
+        metrics::record_meta_tool("call_tool", status);
 
         Ok(compression::compress(&self.state, &entry.server, result).await)
     }
@@ -344,8 +401,17 @@ impl GatewayServer {
         &self,
         Parameters(ExecuteCodeParams { code, timeout_ms }): Parameters<ExecuteCodeParams>,
     ) -> CallToolResult {
+        let started = Instant::now();
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(10_000).clamp(100, 60_000));
-        code_mode::execute(&code, self.state.clone(), timeout).await
+        let result = code_mode::execute(&code, self.state.clone(), timeout).await;
+        let status = if result.is_error == Some(true) {
+            "error"
+        } else {
+            "ok"
+        };
+        metrics::record_code_mode(status, started.elapsed().as_secs_f64());
+        metrics::record_meta_tool("execute_code", status);
+        result
     }
 }
 
@@ -396,6 +462,16 @@ fn config_path() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    metrics::init();
+
+    if let Some(addr) = metrics::configured_addr() {
+        tokio::spawn(async move {
+            if let Err(err) = metrics::serve_http(addr).await {
+                eprintln!("metrics: failed to serve on {addr}: {err}");
+            }
+        });
+    }
+
     let state = Arc::new(GatewayState::new());
 
     let path = config_path();
@@ -404,6 +480,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (servers, compression) = config.into_parts();
             for server in &servers {
                 state.register_config(server.clone());
+                metrics::set_server_connected(&server.name, false);
+                metrics::set_catalog_tools(&server.name, 0);
             }
 
             if let Some(settings) = compression {
@@ -451,6 +529,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let server = GatewayServer { state };
+    let meta_tokens: u64 = GatewayServer::tool_router()
+        .list_all()
+        .iter()
+        .map(|tool| metrics::count_tokens(&serde_json::to_string(tool).unwrap_or_default()))
+        .sum();
+    metrics::set_meta_definition_tokens(meta_tokens);
+
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

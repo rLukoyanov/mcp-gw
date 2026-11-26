@@ -3,6 +3,8 @@
 MCP-шлюз на Rust: подключается к вашим MCP-серверам и отдаёт модели **прогрессивный поиск
 инструментов** вместо того, чтобы грузить все определения тулов в контекст сразу.
 
+> Измерения и выводы «где выигрываем»: **[RESULTS.md](RESULTS.md)**.
+
 Реализованы три паттерна из [MCP Client Best Practices](https://modelcontextprotocol.io/docs/2026-07-28/develop/clients/client-best-practices):
 
 - **Progressive discovery** — каталог → инспекция → вызов (`search_tools` / `get_tool_details` / `call_tool`).
@@ -74,6 +76,87 @@ MCP Inspector и т.п.):
 
 `mcp.json` — отдельный файл со списком **ваших** upstream-серверов (см. ниже).
 
+## Метрики
+
+Шлюз отдаёт Prometheus-метрики по HTTP. Адрес задаётся `MCP_GW_METRICS_ADDR`
+(по умолчанию `127.0.0.1:9464`, значение `off` отключает). Формат — обычный `/metrics`.
+
+```bash
+MCP_GW_METRICS_ADDR=0.0.0.0:9464 MCP_GW_CONFIG=./mcp.json ./target/release/mcp-gw
+curl -s localhost:9464/metrics | grep mcp_gw_
+```
+
+Метрики:
+
+| Метрика | Тип | Что показывает |
+|---------|-----|----------------|
+| `mcp_gw_meta_tool_calls_total{tool,status}` | counter | вызовы мета-тулов (`search_tools`, `call_tool`, ...) |
+| `mcp_gw_tool_calls_total{tool,server,status}` | counter | вызовы upstream-тулов |
+| `mcp_gw_tool_call_duration_seconds{tool,server}` | histogram | задержка вызовов upstream |
+| `mcp_gw_code_mode_executions_total{status}` | counter | запуски `execute_code` |
+| `mcp_gw_code_mode_duration_seconds` | histogram | длительность `execute_code` |
+| `mcp_gw_compression_total{outcome}` | counter | итоги авто-сжатия |
+| `mcp_gw_catalog_tools{server}` | gauge | тулов в каталоге по серверу |
+| `mcp_gw_servers_connected{server}` | gauge | 1/0 — подключён ли сервер |
+| `mcp_gw_tool_definition_tokens{server}` | gauge | токены всех определений тулов сервера (baseline «без шлюза») |
+| `mcp_gw_meta_tool_definition_tokens` | gauge | токены 7 мета-тулов шлюза |
+| `mcp_gw_inspection_tokens_total` | counter | токены ответов `search_tools` / `get_tool_details` |
+| `mcp_gw_compression_original_tokens_total` | counter | токены до сжатия Headroom |
+| `mcp_gw_compression_compressed_tokens_total` | counter | токены после сжатия Headroom |
+| `mcp_gw_compression_saved_tokens_total` | counter | сэкономленные токены Headroom |
+
+Токены считаются **реальным токенайзером tiktoken** (`o200k_base` по умолчанию).
+Кодировку можно выбрать через `MCP_GW_TOKENIZER`:
+`o200k_base`, `cl100k_base`, `p50k_base`, `r50k_base`. Текущая кодировка видна в
+метрике `mcp_gw_tokenizer_info{tokenizer=...}`. Это уже не `символы / 4`; для
+конкретной модели провайдера точные цифры даёт A/B-бенчмарк (результаты в `RESULTS.md`).
+
+Метрики отдаются в стандартном Prometheus-формате; их может скрейпить любой Prometheus.
+
+## Экономия токенов
+
+Есть два способа проверить экономию.
+
+### 1. Модель стоимости (без LLM)
+
+По метрикам на одном и том же каталоге видно, сколько токенов ушло бы на все
+определения тулов при прямом подключении и сколько тратит шлюз:
+
+- direct baseline: `sum(mcp_gw_tool_definition_tokens)`
+- gateway: `mcp_gw_meta_tool_definition_tokens`
+- плюс загруженные по требованию схемы: `mcp_gw_inspection_tokens_total`
+- плюс экономия сжатия: `mcp_gw_compression_saved_tokens_total`
+
+Реальный токенайзер (`o200k_base`), набор из `mcp.json` (4 сервера, 42 тула):
+baseline **19 416** токенов, мета-тулы шлюза **1 367** — стартовая экономия
+**93.0%**; после инспекции двух тулов (2 253 токена ответов) остаётся **81.4%**.
+С DeepWiki (5 серверов, 47 тулов): baseline **19 815**, экономия **93.1%**.
+Эти числа видны в метриках и на графиках в `RESULTS.md`.
+
+### 2. Реальный A/B на промптах через LLM
+
+Бенчмарк запускал `opencode run --format json` на одних и тех же промптах дважды:
+с прямым подключением всех серверов и через `mcp-gw`, и сравнивал **реальные токены
+провайдера** из событий `step_finish` (total/input/output/cache/cost). Скрипт
+бенчмарка не входит в минимальный репозиторий; зафиксированные артефакты — в `results/`.
+
+Последний снимок — **20 промптов** (filesystem, memory, sequential-thinking,
+everything). Полная таблица: `results/ab_tokens_table.md`, графики и разбор —
+в [RESULTS.md](RESULTS.md).
+
+| | direct | gateway | разница |
+|---|---:|---:|---:|
+| input (некэш.) | 169 513 | 175 270 | gateway **+3.4%** |
+| cost | $0.03235 | $0.03932 | gateway **+21.5%** |
+| total (с cache read) | 1 228 334 | 1 220 324 | gateway **−0.7%** |
+
+Ключевой эффект — **кэш определений тулов у провайдера**. На первом промпте
+(кэш холодный) шлюз дешевле: input −49.1%, cost −33.1%. Дальше direct получает
+cache-hit'ы на свои 47 определений (input падает до 269–1 275), а шлюз платит
+за discovery (~8–10k input) — на длинной серии простых задач direct может быть
+дешевле. Предыдущий 3-промптовый прогон при более холодном кэше дал −61.7% input
+и −45.6% cost. Артефакты: `results/ab_tokens.json`, `results/ab_tokens_table.md`, графики в `results/`.
+
 ## Конфиг `mcp.json`
 
 Формат совместим с Claude Desktop, плюс два поля: `description` и `autoConnect`.
@@ -122,6 +205,43 @@ MCP Inspector и т.п.):
 
 > Подстановки переменных окружения в `mcp.json` нет — значения записываются буквально.
 > Держите файл с секретами вне системы контроля версий.
+
+### Готовый набор серверов
+
+Пример набора серверов (создайте `mcp.json` рядом с бинарём; сам файл в минимальный
+репозиторий не входит):
+
+| Сервер | Что даёт | Инструментов |
+|--------|----------|--------------|
+| `filesystem` | чтение/запись/поиск файлов в текущем каталоге | 16 |
+| `memory` | граф знаний (сущности и связи) | 9 |
+| `sequential-thinking` | пошаговое рассуждение | 1 |
+| `everything` | демо-сервер со множеством примеров | 16 |
+| `deepwiki` | публичный DeepWiki MCP (docs по GitHub-репозиториям, `url`) | 3 |
+
+Итого ~45 инструментов. `filesystem`/`memory`/`sequential-thinking`/`everything`
+подключаются на старте; `deepwiki` — ленивый (`autoConnect: false`), включается через
+`enable_server` (публичный HTTPS, без токена). Первый запуск может быть медленнее —
+`npx` скачивает пакеты.
+
+Чтобы добавить сервер с секретом (GitHub, поиск и т.п.), допишите запись в `mcp.json`
+с `env`/`headers` и при необходимости `autoConnect: false`.
+
+### Агенты (10 + 10)
+
+В репозитории лежат два набора ролей, все работают через MCP-шлюз:
+
+- **Claude Code**: `.claude/agents/gw-*.md` — 10 субагентов (researcher, reviewer,
+  planner, debugger, tester, docs-writer, refactorer, security-auditor,
+  performance-analyst, release-manager). Claude Code подхватывает их при старте;
+  вызов — через делегирование субагентам.
+- **opencode**: `.opencode/agent/gw-*.md` — те же 10 ролей с `mode: subagent`.
+  После добавления файлов перезапустите opencode; субагенты вызываются через
+  инструмент `task` из primary-агента (напрямую `--agent gw-*` нельзя — они subagent).
+
+Все промпты инструктируют сначала искать возможности (`search_servers`/`search_tools`),
+читать схему (`get_tool_details`), вызывать (`call_tool`), а для цепочек использовать
+`execute_code`; при сжатом результате — `headroom_retrieve`.
 
 ## Авто-сжатие через Headroom
 
@@ -175,6 +295,28 @@ cargo build
 # в mcp.json: "compression": { "server": "headroom", "minBytes": 20 }
 #             "headroom": { "command": "<repo>/target/debug/demo_headroom" }
 ```
+
+### Тест с реальным Headroom
+
+Отдельного E2E-скрипта в минимальном репозитории нет; ниже — зафиксированный
+прогон. Проверялось:
+
+- результат сжат и содержит `structuredContent.headroom` (hash, токены);
+- `headroom_compress` скрыт из каталога, `headroom_retrieve` доступен;
+- `headroom_retrieve` возвращает исходный контент байт-в-байт;
+- метрика `mcp_gw_compression_saved_tokens_total` выросла.
+
+Установка реального Headroom:
+
+```bash
+uv tool install "headroom-ai[mcp]"
+# шлюз запускает: uvx --python 3.12 --from "headroom-ai[mcp]" headroom mcp serve
+```
+
+Пример прогона на реальном Headroom: JSON-лог **23 608 → 12 031 токенов
+(49%)**, `headroom_retrieve` вернул исходные 58 858 символов. На обычном
+тексте Headroom может вернуть `router:noop` (0%) — это нормально; он эффективен
+на JSON, логах и результатах поиска.
 
 ## Инструменты шлюза
 
@@ -286,7 +428,8 @@ printf '%s\n' \
 ## Разработка
 
 ```bash
-cargo test          # юнит-тесты (конфиг, каталог, неймспейсинг)
+cargo build --release --locked
+cargo test
 cargo clippy --all-targets
 cargo fmt
 ```
@@ -303,3 +446,6 @@ cargo fmt
 | `src/code_mode.rs` | Песочница QuickJS и брокер `callTool`. |
 | `src/bin/demo_upstream.rs` | Демо upstream-сервер для тестов. |
 | `src/bin/demo_headroom.rs` | Заглушка Headroom для проверки авто-сжатия. |
+| `results/` | Зафиксированные результаты A/B, Headroom и графики. |
+| `.claude/agents/gw-*.md` | 10 субагентов Claude Code. |
+| `.opencode/agent/gw-*.md` | 10 субагентов opencode. |

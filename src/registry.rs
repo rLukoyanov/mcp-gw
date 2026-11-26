@@ -7,6 +7,7 @@ use rmcp::service::{Peer, RoleClient};
 use tokio::sync::Mutex;
 
 use crate::config::{CompressionSettings, ServerConfig};
+use crate::metrics;
 
 /// One tool aggregated from an upstream MCP server.
 #[derive(Clone)]
@@ -93,6 +94,9 @@ impl GatewayState {
             .write()
             .unwrap()
             .insert(server.to_string(), token);
+        metrics::set_server_connected(server, true);
+        metrics::set_catalog_tools(server, 0);
+        metrics::set_server_definition_tokens(server, 0);
     }
 
     pub fn peer(&self, server: &str) -> Option<Peer<RoleClient>> {
@@ -110,6 +114,9 @@ impl GatewayState {
         if let Some(token) = self.tokens.write().unwrap().remove(server) {
             token.cancel();
         }
+        metrics::set_server_connected(server, false);
+        metrics::set_catalog_tools(server, 0);
+        metrics::set_server_definition_tokens(server, 0);
         removed_peer
     }
 
@@ -145,6 +152,22 @@ impl GatewayState {
                 tool,
             });
         }
+
+        let count = catalog
+            .iter()
+            .filter(|entry| entry.server == server)
+            .count();
+        metrics::set_catalog_tools(server, count);
+
+        let tokens: u64 = catalog
+            .iter()
+            .filter(|entry| entry.server == server)
+            .map(|entry| {
+                let json = serde_json::to_string(&entry.tool).unwrap_or_default();
+                metrics::count_tokens(&json)
+            })
+            .sum();
+        metrics::set_server_definition_tokens(server, tokens);
     }
 
     /// Configured servers matching `query` (by name or description), with their

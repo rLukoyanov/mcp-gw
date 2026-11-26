@@ -1,6 +1,7 @@
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use serde_json::{Value, json};
 
+use crate::metrics;
 use crate::registry::GatewayState;
 
 /// Route a tool result through the configured compressor (Headroom) when it is
@@ -14,6 +15,7 @@ pub async fn compress(
     result: CallToolResult,
 ) -> CallToolResult {
     if result.is_error == Some(true) {
+        metrics::record_compression("tool_error");
         return result;
     }
 
@@ -26,10 +28,12 @@ pub async fn compress(
 
     let payload = render_payload(&result);
     if payload.len() < settings.min_bytes {
+        metrics::record_compression("skipped_small");
         return result;
     }
 
     let Some(peer) = state.peer(&settings.server) else {
+        metrics::record_compression("no_peer");
         eprintln!(
             "compression: server '{}' is not connected; returning uncompressed result",
             settings.server
@@ -46,6 +50,7 @@ pub async fn compress(
     let compressed = match peer.call_tool(request).await {
         Ok(response) if response.is_error != Some(true) => response,
         Ok(_) => {
+            metrics::record_compression("error");
             eprintln!(
                 "compression: '{}' returned an error; returning uncompressed result",
                 settings.compress_tool
@@ -53,6 +58,7 @@ pub async fn compress(
             return result;
         }
         Err(err) => {
+            metrics::record_compression("error");
             eprintln!(
                 "compression: call to '{}' failed: {err}",
                 settings.compress_tool
@@ -62,6 +68,7 @@ pub async fn compress(
     };
 
     let Some(info) = parse_info(&compressed) else {
+        metrics::record_compression("bad_response");
         eprintln!(
             "compression: unexpected response from '{}'; returning uncompressed result",
             settings.compress_tool
@@ -69,10 +76,23 @@ pub async fn compress(
         return result;
     };
 
-    // Do not make things worse if the compressor did not actually save anything.
-    if info.compressed.len() >= payload.len() {
+    let original_tokens = info
+        .original_tokens
+        .unwrap_or_else(|| metrics::count_tokens(&payload));
+    let compressed_tokens = info
+        .compressed_tokens
+        .unwrap_or_else(|| metrics::count_tokens(&info.compressed));
+
+    // Do not make things worse if the compressor did not actually save tokens.
+    // Prefer Headroom's own token counts; the compressed text can be longer in
+    // characters while still being cheaper in tokens.
+    if compressed_tokens >= original_tokens {
+        metrics::record_compression("no_gain");
         return result;
     }
+
+    metrics::record_compression("compressed");
+    metrics::record_compression_tokens(original_tokens, compressed_tokens);
 
     let retrieve_hint = format!(
         "Call {} with {{\"hash\":\"{}\"}} to retrieve the full original content.",
@@ -83,8 +103,9 @@ pub async fn compress(
         "headroom": {
             "compressed": info.compressed,
             "hash": info.hash,
-            "original_tokens": info.original_tokens,
-            "compressed_tokens": info.compressed_tokens,
+            "original_tokens": original_tokens,
+            "compressed_tokens": compressed_tokens,
+            "tokens_saved": original_tokens.saturating_sub(compressed_tokens),
             "savings_percent": info.savings_percent,
             "retrieve": retrieve_hint,
         }
