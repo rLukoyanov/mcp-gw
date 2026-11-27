@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "env": {
+        "LOG_LEVEL": "warn"
+      },
+      "description": "Local filesystem access"
+    },
+    "remote-example": {
+      "url": "https://example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN_HERE"
+      },
+      "description": "Example remote MCP server, connected only when targeted",
+      "autoConnect": false
+    }
+  }
+}
