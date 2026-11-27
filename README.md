@@ -230,6 +230,35 @@ call_tool        {"server": "filesystem", "tool": "read_file",
 - There is no runtime enable/disable tool; `autoConnect` controls whether a
   server starts connected.
 
+## Measuring token savings
+
+`internal/gateway/tokenbench_test.go` estimates token spend with and without the
+gateway using the `o200k_base` tokenizer and a synthetic catalog. It compares:
+
+- **tool definitions** — what the client sees in its context on every request;
+- **full flow** — input tokens for the whole task, counting two requests for a
+  direct client (tool call, then answer) and five for the gateway
+  (`search_servers`, `search_tools`, `get_tool_details`, `call_tool`, answer).
+
+```bash
+go test ./internal/gateway -run TestTokenSpendWithAndWithoutGateway -v
+```
+
+Example output (tokens, negative savings mean the gateway costs more):
+
+| catalog | defs direct | defs gateway | defs saved | flow direct | flow gateway | flow saved |
+|---|--:|--:|--:|--:|--:|--:|
+| 1×1 | 84 | 866 | −931% | 298 | 5243 | −1659% |
+| 1×4 | 423 | 866 | −105% | 976 | 5523 | −466% |
+| 2×4 | 843 | 866 | −3% | 1816 | 5703 | −214% |
+| 3×4 | 1263 | 866 | 31% | 2656 | 5839 | −120% |
+| 5×8 | 4203 | 866 | 79% | 8536 | 5800 | 32% |
+| 10×10 | 10511 | 866 | 92% | 21152 | 5855 | 72% |
+
+The gateway pays a fixed discovery overhead. Definition tokens already drop at
+around 12 tools, but the full flow only becomes cheaper once the catalog is
+large: at 40 tools it saves about a third, and at 100 tools about 72%.
+
 ## Development
 
 ```bash
