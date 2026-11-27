@@ -1,803 +1,249 @@
 # tokenmaxing
 
-MCP-шлюз на Rust: подключается к вашим MCP-серверам и отдаёт модели **прогрессивный
-поиск инструментов** вместо того, чтобы грузить все определения тулов в контекст сразу.
+A proxy for MCP (Model Context Protocol) that reduces token consumption by hiding
+upstream tools behind a small set of discovery tools.
 
-- **Стартовый контекст — на 95% меньше**: на каталоге из 42 тулов 19 416 → 901 токен.
-- **Стабильный набор из 7 мета-тулов в discovery**: массив `tools` не меняется между
-  ходами, что дружелюбно к prompt caching.
-- **Гибридный режим**: маленький каталог отдаётся напрямую (`passthrough`), большой —
-  через прогрессивный поиск; режим выбирается автоматически.
-- **Adaptive discovery**: узкий запрос сразу получает компактную схему, широкий —
-  только имена.
-- **Кеш использованных тулов**: частые тулы поднимаются в поиске и попадают в
-  instructions для повторных задач.
-- **Opt-in кеш результатов тулов**: exact + semantic (эмбеддинги), с allowlist,
-  TTL, персистентностью и метриками.
-- **Сжатие крупных результатов** через Headroom: до −49% на JSON и логах.
-- Два транспорта до upstream (**stdio** и **Streamable HTTP**), песочница **QuickJS**
-  для code mode, **Prometheus-метрики**, наборы агентов для Claude Code и opencode.
+Instead of exposing every tool of every connected MCP server, `tokenmaxing`
+advertises only four tools. The model searches for what it needs, reads the
+schema, and then calls the upstream tool — all through the proxy.
 
-Замеры, методика и честные оговорки — в **[RESULTS.md](RESULTS.md)**.
+## Features
 
-## Зачем это нужно
+- Speaks MCP to the client over stdio.
+- Connects to any number of upstream MCP servers over stdio (`command`) or
+  HTTP (`url`).
+- Exposes four meta-tools instead of the full upstream tool catalog:
+  - `search_servers` — find an upstream server by capability.
+  - `search_tools` — find tools by name or description.
+  - `get_tool_details` — read a tool's full input schema.
+  - `call_tool` — invoke an upstream tool and relay the result unchanged.
+- Connects servers at startup or lazily, per server (`autoConnect`).
+- A broken upstream does not take the proxy down: it is reported as
+  disconnected with its error.
 
-Прямое подключение всех MCP-серверов кладёт в контекст каждое определение каждого тула.
-42 тула — это ~19 400 токенов ещё до первого вопроса, и цена растёт с каждым новым
-сервером. Шлюз реализует три паттерна из
-[MCP Client Best Practices](https://modelcontextprotocol.io/docs/2026-07-28/develop/clients/client-best-practices):
+## Quick start
 
-- **Progressive discovery** — каталог → инспекция → вызов
-  (`search_tools` / `get_tool_details` / `call_tool`).
-- **Dynamic server management** — серверы подключаются и отключаются по требованию
-  (`search_servers` / `enable_server` / `disable_server`).
-- **Programmatic tool calling (code mode)** — модель пишет JS в песочнице и склеивает
-  несколько вызовов без прогона промежуточных результатов через контекст (`execute_code`).
-
-В режиме **discovery** наружу отдаются **7 мета-тулов**, и определения upstream-тулов
-попадают в контекст только по запросу. В режиме **passthrough** (для маленьких каталогов)
-тулы отдаются напрямую, как без шлюза. Режим выбирается автоматически или явно через
-`TOKENMAXING_MODE` — см. [Режимы работы](#режимы-работы).
-
-## Быстрый старт
-
-### 1. Соберите
-
-Нужен **Rust 1.88+** (edition 2024, let-chains). Node.js/`npx` понадобится только для
-upstream-серверов, которые запускаются через Node.
+Build the binary:
 
 ```bash
 git clone https://github.com/rLukoyanov/tokenmaxing.git
 cd tokenmaxing
-cargo build --release
+go build -o tokenmaxing .
 ```
 
-Соберутся три бинаря:
+Write a proxy configuration listing upstream MCP servers:
 
-| Бинарь | Назначение |
-|--------|-----------|
-| `target/release/tokenmaxing` | сам шлюз (MCP-сервер по stdio) |
-| `target/release/demo_upstream` | демо upstream с тулами `echo` и `ping` |
-| `target/release/demo_headroom` | заглушка Headroom для проверки авто-сжатия |
-
-### 2. Проверьте за минуту (без сети)
-
-Создайте временный конфиг с демо-сервером. Замените `/ABS/PATH/tokenmaxing` на абсолютный
-путь к репозиторию:
-
-```bash
-cat > /tmp/tokenmaxing-demo.json <<'EOF'
+```json
 {
   "mcpServers": {
-    "demo": {
-      "command": "/ABS/PATH/tokenmaxing/target/release/demo_upstream",
-      "description": "Echo/ping demo",
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "env": { "LOG_LEVEL": "warn" },
+      "description": "Local filesystem access"
+    },
+    "github": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ..." },
+      "description": "GitHub repositories and issues",
       "autoConnect": false
     }
   }
 }
-EOF
 ```
 
-Теперь отправьте шлюзу `initialize` и `tools/list` по stdio:
+Validate it:
 
 ```bash
-printf '%s\n' \
-'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
-'{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-'{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-| TOKENMAXING_METRICS_ADDR=off TOKENMAXING_CONFIG=/tmp/tokenmaxing-demo.json ./target/release/tokenmaxing
+./tokenmaxing config validate --config ./config.json
+# config.json: ok, 2 MCP server(s) configured
 ```
 
-В ответе на `tools/list` будут ровно семь имён:
+## Connecting a client
 
-```
-call_tool, disable_server, enable_server, execute_code,
-get_tool_details, search_servers, search_tools
-```
+The client launches `tokenmaxing serve` as a normal stdio MCP server. Use
+absolute paths for both the binary and the configuration file.
 
-Строка `gateway ready with 0 tools` в stderr — норма: демо-сервер ленивый
-(`autoConnect: false`) и подключается только по запросу модели.
-
-> Здесь выбран discovery, потому что демо-сервер ленивый. Если все серверы
-> `autoConnect: true`, подключились, и тулов не больше 20, `auto` выберет
-> passthrough — тогда `tools/list` вернёт `echo` и `ping` напрямую.
-
-Дальше модель (или MCP-клиент) проходит цикл:
-
-1. `search_servers` → видит `demo`, `connected: false`.
-2. `enable_server { "name": "demo" }` → подключено 2 тула.
-3. `search_tools { "query": "echo", "detail": "full" }` → находит `echo` со схемой.
-4. `call_tool { "name": "echo", "arguments": { "text": "hi" } }` → возвращает `"hi"`.
-5. Для цепочки вызовов — `execute_code` (см. [ниже](#code-mode)).
-
-### 3. Подключите к MCP-клиенту
-
-Добавьте шлюз как обычный stdio-сервер в Claude Desktop, Cursor, MCP Inspector или
-другой MCP-клиент:
+Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`
+on macOS):
 
 ```json
 {
   "mcpServers": {
     "tokenmaxing": {
-      "command": "/abs/path/to/tokenmaxing/target/release/tokenmaxing",
-      "env": {
-        "TOKENMAXING_CONFIG": "/abs/path/to/mcp.json"
-      }
+      "command": "/path/to/tokenmaxing",
+      "args": ["serve", "--config", "/path/to/config.json"]
     }
   }
 }
 ```
 
-- `TOKENMAXING_CONFIG` указывает на **ваш** файл со списком upstream-серверов. Если не задать,
-  шлюз ищет `./mcp.json` относительно своего рабочего каталога.
-- Клиент сам запускает шлюз и общается с ним по stdio (JSON-RPC). Вручную в терминале
-  его запускать не нужно.
-- Первый запуск с `npx`-серверами может быть медленнее: `npx` скачивает пакеты.
+Claude Code:
 
-### 4. Создайте свой `mcp.json`
+```bash
+claude mcp add tokenmaxing -- /path/to/tokenmaxing serve --config /path/to/config.json
+```
 
-В репозитории нет готового `mcp.json`: файл содержит ваши пути и секреты. Создайте его
-рядом с конфигом клиента — формат совместим с Claude Desktop плюс поля `description`
-и `autoConnect`:
+Restart the client and confirm the server is listed (`claude mcp list`).
+
+## Configuration
+
+The configuration file is JSON and compatible with Claude Desktop's
+`mcpServers` format. Unknown fields are ignored, so existing Claude
+configurations can be reused.
 
 ```json
 {
   "mcpServers": {
-    "filesystem": {
+    "<name>": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/abs/path/to/workspace"],
-      "description": "Read and search files in the workspace",
+      "args": ["-y", "some-mcp-server"],
+      "env": { "KEY": "value" },
+      "description": "What this server provides",
       "autoConnect": true
     },
-    "memory": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-memory"],
-      "description": "Knowledge graph memory across conversations",
-      "autoConnect": true
-    },
-    "deepwiki": {
-      "url": "https://mcp.deepwiki.com/mcp",
-      "description": "Public DeepWiki MCP for GitHub repository docs (no auth)",
+    "<remote-name>": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ..." },
+      "description": "What this server provides",
       "autoConnect": false
     }
   }
 }
 ```
 
-`filesystem` и `memory` подключатся на старте, `deepwiki` — по `enable_server`.
-Полное описание формата — в разделе [Конфигурация](#конфигурация-mcpjson).
+| Field | Applies to | Description |
+|---|---|---|
+| `command` | stdio | Executable that starts a local MCP server. |
+| `args` | stdio | Arguments for `command`. |
+| `env` | stdio | Extra environment variables for `command`. |
+| `url` | HTTP | Endpoint of a remote MCP server (`http` or `https`). |
+| `headers` | HTTP | Headers added to every request to the remote server. |
+| `description` | both | Human-readable description used by `search_servers`. |
+| `autoConnect` | both | Connect at startup. Defaults to `true`. |
 
-## Содержание
+Exactly one of `command` or `url` must be set per server. Server names must be
+non-empty and unique (they are JSON object keys).
 
-- [Как это работает](#как-это-работает)
-- [Режимы работы](#режимы-работы)
-- [Конфигурация `mcp.json`](#конфигурация-mcpjson)
-- [Инструменты шлюза](#инструменты-шлюза)
-- [Кеш использованных тулов](#кеш-использованных-тулов)
-- [Кеш результатов тулов](#кеш-результатов-тулов)
-- [Авто-сжатие через Headroom](#авто-сжатие-через-headroom)
-- [Метрики](#метрики)
-- [Экономия токенов](#экономия-токенов)
-- [Переменные окружения](#переменные-окружения)
-- [Поведение и детали](#поведение-и-детали)
-- [Ограничения](#ограничения)
-- [Диагностика](#диагностика)
-- [Разработка](#разработка)
+### Path resolution
 
-## Как это работает
+The configuration file is looked up in this order:
 
-```
-LLM / MCP client
-      │  (stdio, JSON-RPC)
-      ▼
-  ┌─────────────┐   search_servers / enable_server / disable_server
-  │ tokenmaxing │   search_tools / get_tool_details / call_tool
-  │  (server)   │   execute_code  ── QuickJS sandbox ── callTool()
-  └──────┬──────┘
-       │  (MCP client, stdio child process или Streamable HTTP)
-       ▼
-  ваши MCP-серверы (filesystem, github, ...)
-```
+1. `--config <path>`
+2. `TOKENMAXING_CONFIG` environment variable
+3. `<user config dir>/tokenmaxing/config.json`
+   (on macOS: `~/Library/Application Support/tokenmaxing/config.json`)
 
-Шлюз сам является MCP-сервером. В discovery-режиме модель видит только мета-тулы;
-upstream-тулы появляются в каталоге после `enable_server` и остаются там, пока сервер
-подключён. В passthrough-режиме каталог виден модели напрямую.
+### autoConnect
 
-| Слой | Что происходит |
-|------|----------------|
-| Каталог | `search_servers` показывает настроенные серверы и их статус. |
-| Discovery | `search_tools` ищет по имени, title, описанию и серверу; `detail` (по умолчанию `auto`) управляет объёмом. |
-| Инспекция | `get_tool_details` отдаёт полные схемы одного или нескольких тулов. |
-| Вызов | `call_tool` маршрутизирует вызов на upstream и проксирует результат. |
-| Композиция | `execute_code` выполняет JS и может вызывать `callTool` многократно. |
+- `true` or omitted — the server is connected during startup and its tools are
+  indexed immediately. `search_tools` finds its tools without naming the server.
+- `false` — the server is not connected at startup and its tools are not
+  requested. It still appears in `search_servers` with `connected: false`.
+  It connects on demand when the model names it in `search_tools(server=...)`,
+  `get_tool_details(server=...)`, or `call_tool`.
 
-### Режимы работы
+## Tools
 
-По умолчанию `TOKENMAXING_MODE=auto`: шлюз сам выбирает режим после подключения серверов.
+### `search_servers`
 
-| Режим | Что видит модель | Когда выбирается |
-|-------|------------------|------------------|
-| `discovery` | 7 мета-тулов | Большой каталог, ленивые (`autoConnect: false`) серверы или ошибка подключения. |
-| `passthrough` | Тулы подключённых upstream-серверов напрямую | `auto`: все настроенные серверы подключены и в каталоге не больше `TOKENMAXING_PASSTHROUGH_MAX_TOOLS` тулов. |
-
-- **`auto`** (по умолчанию) — passthrough только для маленького полностью подключённого
-  каталога; иначе discovery. Так discovery-накладные не платятся там, где не окупаются,
-  а на больших каталогах сохраняется экономия контекста.
-- **`discovery`** — всегда 7 мета-тулов: `search_tools`, `get_tool_details`, `call_tool`,
-  `execute_code`, `search_servers`, `enable_server`, `disable_server`.
-- **`passthrough`** — модель видит определения upstream-тулов напрямую, как без шлюза.
-  Авто-сжатие Headroom продолжает работать. Мета-тулы и `execute_code` в этом режиме
-  недоступны, а ленивые/отключённые серверы не попадают в список.
-
-Порог задаётся `TOKENMAXING_PASSTHROUGH_MAX_TOOLS` (1–10 000, по умолчанию 20).
-В passthrough шлюз пересылает клиенту `notifications/tools/list_changed`, когда upstream
-меняет набор тулов; в discovery `tools/list` стабилен, а каталог обновляется внутренне.
-
-```bash
-# Принудительно discovery
-TOKENMAXING_MODE=discovery ./target/release/tokenmaxing
-
-# Auto-passthrough с более высоким порогом
-TOKENMAXING_PASSTHROUGH_MAX_TOOLS=40 ./target/release/tokenmaxing
+```json
+{ "query": "filesystem", "limit": 5 }
 ```
 
-## Конфигурация `mcp.json`
+Returns compact server summaries: `name`, `description`, `transport`,
+`autoConnect`, `connected`, `toolCount`, and `error` if the connection failed.
+An empty query lists all servers, up to `limit`.
 
-Формат совместим с Claude Desktop, плюс два поля: `description` и `autoConnect`.
-Опциональный блок `compression` включает авто-сжатие результатов.
+### `search_tools`
+
+```json
+{ "query": "read a file", "server": "filesystem", "limit": 5 }
+```
+
+Returns tools across connected servers: `server`, `name`, `description`.
+`server` narrows the search and connects an on-demand server first. Without
+`server`, only already connected servers are searched.
+
+### `get_tool_details`
+
+```json
+{ "tool": "read_file", "server": "filesystem" }
+```
+
+Returns the full `inputSchema`. An exact, case-insensitive name match is
+preferred; otherwise tools whose name contains the query are returned.
+
+### `call_tool`
 
 ```json
 {
-  "compression": {
-    "server": "headroom",
-    "minBytes": 512
-  },
-  "mcpServers": {
-    "headroom": {
-      "command": "headroom",
-      "args": ["mcp", "serve"],
-      "description": "Headroom compression/retrieval"
-    },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/projects"],
-      "env": { "SOME_TOKEN": "value" },
-      "description": "Локальный доступ к файлам в ~/projects",
-      "autoConnect": true
-    },
-    "remote": {
-      "url": "https://mcp.example.com/mcp",
-      "headers": { "Authorization": "Bearer literal-token" },
-      "description": "Удалённый MCP-сервер по Streamable HTTP",
-      "autoConnect": false
-    }
-  }
+  "server": "filesystem",
+  "tool": "read_file",
+  "arguments": { "path": "/tmp/notes.txt" }
 }
 ```
 
-### Поля сервера
+Connects the server if needed and returns the upstream result unchanged,
+including `content`, `structuredContent`, and `isError`.
 
-| Поле | Транспорт | Описание |
-|------|-----------|----------|
-| `command` | stdio | Команда запуска дочернего процесса. |
-| `args` | stdio | Аргументы команды. |
-| `env` | stdio | Переменные окружения дочернего процесса. |
-| `url` | HTTP | URL Streamable HTTP эндпоинта. |
-| `headers` | HTTP | HTTP-заголовки (например, `Authorization`). |
-| `description` | оба | Текст для `search_servers`. |
-| `autoConnect` | оба | Подключаться на старте. По умолчанию `true`. Ленивый сервер оставляет auto-режим в discovery. |
+### Typical flow
 
-Правила:
+```
+search_servers   {"query": "filesystem"}
+  → filesystem: connected=true, toolCount=2
 
-- Ровно один транспорт на сервер: либо `command`, либо `url`.
-  Некорректные записи пропускаются с предупреждением в stderr.
-- `autoConnect: false` оставляет сервер в конфиге, но не подключает его до
-  `enable_server`. Это удобно для тяжёлых или редких серверов.
-- Если файл не найден или не разбирается, шлюз пишет предупреждение и стартует
-  с пустым каталогом — клиент при этом продолжает работать.
+search_tools     {"query": "read", "server": "filesystem"}
+  → filesystem/read_file
 
-> Подстановки переменных окружения в `mcp.json` нет — значения записываются буквально.
-> Держите файл с секретами вне системы контроля версий.
+get_tool_details {"tool": "read_file", "server": "filesystem"}
+  → full inputSchema
 
-### Рекомендуемый стартовый набор
-
-Пять серверов, которые удобно взять за основу (~45 инструментов):
-
-| Сервер | Что даёт | Инструментов |
-|--------|----------|--------------|
-| `filesystem` | чтение/запись/поиск файлов в выбранном каталоге | 16 |
-| `memory` | граф знаний (сущности и связи) | 9 |
-| `sequential-thinking` | пошаговое рассуждение | 1 |
-| `everything` | демо-сервер со множеством примеров | 16 |
-| `deepwiki` | публичный DeepWiki MCP (docs по GitHub-репозиториям, `url`) | 3 |
-
-Первые четыре запускаются через `npx`, поэтому первый старт может быть медленнее.
-`deepwiki` — публичный HTTPS без токена; держите его ленивым (`autoConnect: false`).
-`sequential-thinking` и `everything` добавляются в `mcpServers` так же, как `memory`,
-с соответствующими пакетами `@modelcontextprotocol/server-*`.
-
-Чтобы добавить сервер с секретом (GitHub, поиск и т.п.), допишите запись в `mcp.json`
-с `env`/`headers` и при необходимости `autoConnect: false`.
-
-### Агенты (10 + 10)
-
-В репозитории лежат два набора ролей, все работают через MCP-шлюз:
-
-- **Claude Code**: `.claude/agents/tokenmaxing-*.md` — 10 субагентов (researcher, reviewer,
-  planner, debugger, tester, docs-writer, refactorer, security-auditor,
-  performance-analyst, release-manager). Claude Code подхватывает их при старте;
-  вызов — через делегирование субагентам.
-- **opencode**: `.opencode/agent/tokenmaxing-*.md` — те же 10 ролей с `mode: subagent`.
-  После добавления файлов перезапустите opencode; субагенты вызываются через
-  инструмент `task` из primary-агента (напрямую `--agent tokenmaxing-*` нельзя — они subagent).
-
-Промпты инструктируют сначала искать возможности (`search_servers`/`search_tools`),
-читать схему (`get_tool_details`), вызывать (`call_tool`), а для цепочек использовать
-`execute_code`; при сжатом результате — `headroom_retrieve`.
-
-## Инструменты шлюза
-
-Мета-тулы доступны в **discovery**-режиме. В **passthrough** их нет: модель вызывает
-upstream-тулы напрямую, а шлюз только маршрутизирует вызов и при необходимости сжимает
-результат.
-
-### Dynamic server management
-
-| Тул | Параметры | Что делает |
-|-----|-----------|------------|
-| `search_servers` | `query?`, `limit?` (по умолч. 20, макс. 100) | Список/поиск настроенных серверов: `name`, `description`, `connected`, `tool_count`. |
-| `enable_server` | `name` | Подключает сервер и загружает его тулы. Идемпотентно. |
-| `disable_server` | `name` | Отключает сервер и убирает его тулы из каталога. |
-
-### Progressive discovery
-
-| Тул | Параметры | Что делает |
-|-----|-----------|------------|
-| `search_tools` | `query`, `limit?` (10, макс. 50), `detail?` | Поиск по name/title/description/server. `detail`: `auto` (по умолч.) \| `name` \| `summary` \| `schema` \| `full`. |
-| `get_tool_details` | `name?` или `names?` | Полное определение: описание, `input_schema`, `output_schema`. `name` возвращает объект, `names` (до 20) — `{ tools, missing }`. |
-| `call_tool` | `name`, `arguments?` | Вызов тула на его upstream-сервере; результат проксируется как есть. |
-
-Уровни `detail` позволяют платить за discovery постепенно:
-
-- `auto` (по умолчанию) — если совпало **1–3** тула, отдаёт компактную схему (как
-  `schema`), иначе — только имена. Для узкого запроса отдельный `get_tool_details`
-  уже не нужен;
-- `name` — только имя и сервер; минимальная цена запроса;
-- `summary` — плюс title и описание, схлопнутое в одну строку (до 200 символов);
-- `schema` — плюс компактная `input_schema` без `$schema`, описаний, примеров и
-  значений по умолчанию;
-- `full` — полная `input_schema`, как у upstream.
-
-`detail: "schema"` или `"full"` в `search_tools` — быстрый способ получить несколько
-схем одним вызовом. `get_tool_details` с `names` — то же самое в полном виде для
-конкретных тулов (до 20 за вызов). Для широкого поиска `auto` ведёт себя как `name`,
-а детализацию можно поднять только для реальных кандидатов.
-
-### Code mode
-
-Доступен только в discovery-режиме.
-
-| Тул | Параметры | Что делает |
-|-----|-----------|------------|
-| `execute_code` | `code`, `timeout_ms?` (10 000; допустимо 100–60 000) | Выполняет JS в песочнице. Доступны `await callTool(name, args)` и `console.*`. Возвращает `{ logs, result }` или `{ logs, error }`. |
-
-Пример кода для `execute_code`:
-
-```js
-const a = await callTool("filesystem_read_file", { path: "/etc/hosts" });
-const b = await callTool("web_fetch", { url: "https://example.com" });
-console.log("прочитано", a.content[0].text.length, "и", b.content[0].text.length, "символов");
-return { first: a.content[0].text.slice(0, 80) };
+call_tool        {"server": "filesystem", "tool": "read_file",
+                  "arguments": {"path": "/tmp/notes.txt"}}
+  → upstream result
 ```
 
-- `callTool` возвращает JSON-представление `CallToolResult`
-  (`content`, `structuredContent`, `isError`, ...).
-- Если upstream вернул `isError: true`, `callTool` **бросает исключение** — можно
-  ловить через `try/catch`.
-- Ошибки и таймауты скрипта возвращаются как тул-результат с `isError: true`,
-  чтобы модель могла исправиться.
-- Промежуточные результаты `callTool` не попадают в контекст — возвращаются только
-  `logs` и итоговое значение.
+## Logging and troubleshooting
 
-#### Безопасность песочницы
+- Logs go to **stderr**; stdout is reserved for the MCP protocol. They appear in
+  the client's MCP server logs.
+- Add `-v` for debug-level logging:
+  ```bash
+  ./tokenmaxing serve --config ./config.json -v
+  ```
+- On startup the proxy logs each connection attempt:
+  ```
+  level=INFO msg="connected upstream server" server=filesystem tools=2
+  level=WARN msg="upstream server unavailable" server=dead error="..."
+  ```
+- `no upstream MCP servers could be connected` — every configured server failed;
+  check `config validate` and each server's `command`/`url`.
+- A server that fails to connect stays visible in `search_servers` with
+  `connected: false` and the error text.
 
-`execute_code` исполняется на встроенном **QuickJS** (`rquickjs`), а не через системный
-Node/Deno:
+## Limitations
 
-- нет доступа к файловой системе, сети, процессам и таймерам;
-- наружу доступны только два моста — `callTool` и `console`;
-- лимиты: память 64 MB, стек 512 KB, таймаут (по умолчанию 10 с) через interrupt
-  handler, включая бесконечные синхронные циклы.
+- Tool lists are captured when a server connects; changes are not refreshed
+  automatically. Restart the proxy after changing an upstream's tools.
+- `call_tool` relays results unchanged — result compression is not implemented.
+- There is no runtime enable/disable tool; `autoConnect` controls whether a
+  server starts connected.
 
-Это песочница уровня языка, а не OS-контейнер. Не запускайте непроверенный код в
-доверенном окружении без дополнительной изоляции процесса.
-
-## Кеш использованных тулов
-
-Шлюз запоминает успешные вызовы тулов и переиспользует их между сессиями:
-
-- учитываются вызовы через `call_tool`, passthrough и `callTool` внутри `execute_code`;
-- хранятся имя, сервер, число вызовов, `last_used` и однострочное описание —
-  **аргументы и результаты не сохраняются**;
-- путь по умолчанию: `$XDG_CACHE_HOME/tokenmaxing/usage-<hash>.json` (или
-  `~/.cache/tokenmaxing/...`); хеш считается от пути конфига, чтобы проекты не смешивались;
-- `TOKENMAXING_CACHE=/path/to/file.json` задаёт свой путь, `off` отключает кеш.
-
-Что это даёт:
-
-- `search_tools` поднимает часто вызываемые тулы в ранжировании;
-- в discovery-instructions добавляются до 5 записей **Frequently used tools** — их
-  можно вызывать сразу, без поиска; для тула с ленивого сервера подсказка просит
-  сначала вызвать `enable_server`;
-- запись атомарная, хранится не больше 2000 записей; ошибки кеша не ломают вызовы.
-
-## Кеш результатов тулов
-
-Opt-in кеш **результатов** `call_tool` / `callTool` (не путать с кешем использованных
-тулов выше). По умолчанию выключен; включается блоком `toolCache` в `mcp.json`.
-
-```json
-{
-  "toolCache": {
-    "enabled": true,
-    "mode": "semantic",
-    "ttlSeconds": 300,
-    "threshold": 0.9,
-    "maxEntries": 200,
-    "maxResultBytes": 65536,
-    "tools": ["filesystem_read_text_file", "filesystem_list_directory"],
-    "embeddings": {
-      "provider": "ollama",
-      "model": "nomic-embed-text",
-      "url": "http://localhost:11434"
-    }
-  }
-}
-```
-
-| Поле | По умолчанию | Описание |
-|------|--------------|----------|
-| `enabled` | `false` | Включить кеш. |
-| `mode` | `exact` | `exact` — только точные аргументы; `semantic` — exact + поиск по эмбеддингам. |
-| `ttlSeconds` | `300` | Время жизни записи. |
-| `threshold` | `0.9` | Минимальная cosine similarity для semantic-попадания. |
-| `maxEntries` | `200` | Лимит записей; старые вытесняются (LRU). |
-| `maxResultBytes` | `65536` | Результаты больше лимита не кешируются. |
-| `tools` | — | **Обязательный allowlist** имён тулов; поддерживается `*` в конце. Пустой список отключает кеш. |
-| `embeddings` | — | Нужен для `semantic`. |
-| `path` | кеш-директория | Путь к файлу кеша. |
-
-`embeddings`:
-
-| Поле | Описание |
-|------|----------|
-| `provider` | `openai` (OpenAI-совместимый), `ollama` или `hash` (лексический оффлайн-провайдер для тестов). |
-| `model` | Модель; обязательна для `openai`/`ollama`. |
-| `url` | База OpenAI (`https://api.openai.com/v1`) или Ollama (`http://localhost:11434`). |
-| `apiKey` | Ключ; fallback — `TOKENMAXING_EMBEDDINGS_API_KEY`. |
-| `dimensions` | Размерность для `hash` (по умолчанию 256). |
-| `timeoutMs` | Таймаут HTTP-запроса (по умолчанию 5000). |
-
-Как работает:
-
-- exact-ключ = тул + сервер + fingerprint определения + канонизированные аргументы;
-- при промахе exact и `mode: semantic` считается эмбеддинг нормализованного текста
-  аргументов; сравниваются только записи того же тула/сервера/fingerprint;
-- fingerprint меняется при изменении схемы тула, а при `list_changed`/`disable_server`
-  кеш сервера очищается;
-- кешируются только успешные результаты не больше `maxResultBytes`;
-- запись персистентная, атомарная, с правами `0600`; TTL и LRU-вытеснение;
-- результаты из кеша проходят обычное авто-сжатие Headroom (если оно включено);
-- учитываются вызовы из `call_tool`, passthrough и `callTool` внутри `execute_code`;
-- имена в `tools` — те, что видит модель (при коллизии это `server__tool`).
-
-> **Что экономит:** кеш убирает повторный **upstream-вызов** и latency, но возвращает
-> тот же результат — **токены контекста не уменьшаются**. Для экономии контекста
-> используйте Headroom; компактный cache-hit с retrieve — возможное следующее расширение.
-
-> **Безопасность:** включайте в `tools` только read-only/идемпотентные тулы. Не
-> кешируйте `write`/`delete`/платежи. Semantic-поиск может вернуть результат для
-> похожего, но не идентичного запроса — проверяйте TTL и инвалидацию. Файл кеша
-> содержит результаты тулов (возможно, чувствительные), поэтому он пишется с `0600`;
-> путь по умолчанию привязан к конфигу.
-
-Метрики: `tokenmaxing_tool_cache_lookups_total{result}` (`hit_exact`, `hit_semantic`,
-`miss`, `bypass`, `error`), `tokenmaxing_tool_cache_entries`,
-`tokenmaxing_tool_cache_saved_calls_total`,
-`tokenmaxing_tool_cache_saved_result_bytes_total`.
-
-## Авто-сжатие через Headroom
-
-Если указан блок `compression`, каждый результат `call_tool` крупнее `minBytes`
-автоматически прогоняется через `headroom_compress` указанного upstream-сервера.
-Модель получает сжатый текст, `hash` и `savings_percent`, а полный оригинал при
-необходимости достаёт через `headroom_retrieve`.
-
-```json
-{
-  "compression": {
-    "server": "headroom",
-    "minBytes": 512,
-    "enabled": true,
-    "compressTool": "headroom_compress",
-    "retrieveTool": "headroom_retrieve"
-  },
-  "mcpServers": {
-    "headroom": {
-      "command": "headroom",
-      "args": ["mcp", "serve"]
-    }
-  }
-}
-```
-
-| Поле | По умолчанию | Описание |
-|------|--------------|----------|
-| `server` | — | Имя сервера в `mcpServers`, предоставляющего инструменты сжатия. |
-| `minBytes` | `512` | Сжимать только результаты не меньше этого размера. |
-| `enabled` | `true` | Выключить сжатие, не удаляя блок. |
-| `compressTool` | `headroom_compress` | Инструмент сжатия. |
-| `retrieveTool` | `headroom_retrieve` | Инструмент восстановления (используется в подсказке модели). |
-
-Поведение:
-
-- Сервер сжатия подключается на старте автоматически, даже если у него
-  `autoConnect: false`.
-- Инструмент `compressTool` **скрывается** из каталога модели, чтобы она не сжимала
-  повторно; `headroom_retrieve` и `headroom_stats` остаются доступными.
-- Результаты самого сервера сжатия (например, `headroom_retrieve`) не сжимаются повторно.
-- Сжатие **fail-open**: если сервер не подключён, вернул ошибку, ответ не разобрался
-  или сжатие не уменьшило число токенов — возвращается исходный результат.
-- Промежуточные вызовы внутри `execute_code` не сжимаются — они и так не попадают
-  в контекст. Сжимаются только результаты `call_tool`, которые видит модель.
-- Итог каждого случая виден в метрике `tokenmaxing_compression_total{outcome}`:
-  `compressed`, `skipped_small`, `no_gain`, `tool_error`, `no_peer`, `error`,
-  `bad_response`.
-
-### Локальная проверка без Headroom
-
-В репозитории есть заглушка `demo_headroom` с инструментами `headroom_compress`,
-`headroom_retrieve` и `headroom_stats`:
+## Development
 
 ```bash
-cargo build
-
-cat > /tmp/tokenmaxing-compress.json <<'EOF'
-{
-  "compression": { "server": "headroom", "minBytes": 20 },
-  "mcpServers": {
-    "headroom": { "command": "/ABS/PATH/tokenmaxing/target/debug/demo_headroom" },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-      "autoConnect": false
-    }
-  }
-}
-EOF
+go test ./...          # unit and integration tests (spawns real stdio servers)
+go test -race ./...
+go vet ./...
 ```
 
-Подключите шлюз с этим конфигом, вызовите `enable_server` для `filesystem` и прочитайте
-достаточно большой файл через `call_tool` — в ответе появится
-`structuredContent.headroom` с `compressed`, `hash` и счётчиками токенов.
+Layout:
 
-### Реальный Headroom
-
-```bash
-uv tool install "headroom-ai[mcp]"
-# шлюз запускает: uvx --python 3.12 --from "headroom-ai[mcp]" headroom mcp serve
 ```
-
-На реальном Headroom JSON-лог в E2E-прогоне сжался с **23 608 до 12 031 токенов (49%)**,
-а `headroom_retrieve` вернул исходные 58 858 символов байт-в-байт. На обычном тексте
-Headroom может вернуть `router:noop` (0%) — это нормально; он эффективен на JSON,
-логах и результатах поиска. Подробности — в [RESULTS.md](RESULTS.md).
-
-## Метрики
-
-Шлюз отдаёт Prometheus-метрики по HTTP. Адрес задаётся `TOKENMAXING_METRICS_ADDR`
-(по умолчанию `127.0.0.1:9464`, значение `off` отключает). Формат — обычный `/metrics`.
-
-```bash
-TOKENMAXING_METRICS_ADDR=0.0.0.0:9464 TOKENMAXING_CONFIG=./mcp.json ./target/release/tokenmaxing
-curl -s localhost:9464/metrics | grep tokenmaxing_
+main.go                     CLI entry point
+cmd/                        Cobra commands: serve, config, version
+internal/config/            configuration parsing, validation, path resolution
+internal/upstream/          MCP client connections (stdio, HTTP)
+internal/gateway/           tool index, discovery tools, lazy connections
 ```
-
-| Метрика | Тип | Что показывает |
-|---------|-----|----------------|
-| `tokenmaxing_meta_tool_calls_total{tool,status}` | counter | вызовы мета-тулов (`search_tools`, `call_tool`, ...) |
-| `tokenmaxing_tool_calls_total{tool,server,status}` | counter | вызовы upstream-тулов |
-| `tokenmaxing_tool_call_duration_seconds{tool,server}` | histogram | задержка вызовов upstream |
-| `tokenmaxing_code_mode_executions_total{status}` | counter | запуски `execute_code` |
-| `tokenmaxing_code_mode_duration_seconds` | histogram | длительность `execute_code` |
-| `tokenmaxing_compression_total{outcome}` | counter | итоги авто-сжатия |
-| `tokenmaxing_catalog_tools{server}` | gauge | тулов в каталоге по серверу |
-| `tokenmaxing_servers_connected{server}` | gauge | 1/0 — подключён ли сервер |
-| `tokenmaxing_tool_definition_tokens{server}` | gauge | токены всех определений тулов сервера (baseline «без шлюза») |
-| `tokenmaxing_meta_tool_definition_tokens` | gauge | токены 7 мета-тулов с компактными схемами (0 в passthrough) |
-| `tokenmaxing_inspection_tokens_total` | counter | токены ответов `search_tools` / `get_tool_details` |
-| `tokenmaxing_compression_original_tokens_total` | counter | токены до сжатия Headroom |
-| `tokenmaxing_compression_compressed_tokens_total` | counter | токены после сжатия Headroom |
-| `tokenmaxing_compression_saved_tokens_total` | counter | сэкономленные токены Headroom |
-| `tokenmaxing_tool_cache_lookups_total{result}` | counter | lookup'ы кеша результатов: `hit_exact`, `hit_semantic`, `miss`, `bypass`, `error` |
-| `tokenmaxing_tool_cache_entries` | gauge | записей в кеше результатов |
-| `tokenmaxing_tool_cache_saved_calls_total` | counter | upstream-вызовы, предотвращённые кешем |
-| `tokenmaxing_tool_cache_saved_result_bytes_total` | counter | байты результатов, отданные из кеша |
-| `tokenmaxing_tokenizer_info{tokenizer}` | gauge | активная кодировка токенайзера |
-
-Токены считаются **реальным токенайзером tiktoken** (`o200k_base` по умолчанию), а не
-`символы / 4`. Кодировку можно выбрать через `TOKENMAXING_TOKENIZER`: `o200k_base`,
-`cl100k_base`, `p50k_base`, `r50k_base`. Для конкретной модели провайдера точные цифры
-даёт A/B-бенчмарк — см. [RESULTS.md](RESULTS.md).
-
-В passthrough метрики мета-тулов (`tokenmaxing_meta_tool_calls_total`,
-`tokenmaxing_meta_tool_definition_tokens`, `tokenmaxing_inspection_tokens_total`)
-остаются нулевыми — смотрите `tokenmaxing_tool_calls_total` и
-`tokenmaxing_tool_definition_tokens`.
-
-Метрики отдаются в стандартном Prometheus-формате, поэтому подходят для любого
-Prometheus/Grafana. Отдельного стека мониторинга в минимальном репозитории нет.
-
-## Экономия токенов
-
-Есть два независимых способа оценить выигрыш.
-
-### 1. Модель стоимости (без LLM)
-
-По метрикам на одном и том же каталоге видно, сколько токенов ушло бы на все
-определения тулов при прямом подключении и сколько тратит шлюз:
-
-- direct baseline: `sum(tokenmaxing_tool_definition_tokens)`;
-- gateway (discovery): `tokenmaxing_meta_tool_definition_tokens`;
-- плюс загруженные по требованию схемы: `tokenmaxing_inspection_tokens_total`;
-- плюс экономия сжатия: `tokenmaxing_compression_saved_tokens_total`.
-
-Реальный токенайзер (`o200k_base`), 4 сервера и 42 тула: baseline **19 416** токенов,
-мета-тулы шлюза **901** — стартовая экономия **95.4%**. После инспекции двух тулов
-(2 253 токена ответов) остаётся **83.8%**. С DeepWiki (5 серверов, 47 тулов): baseline
-**19 815**, стартовая экономия **95.5%**.
-
-### 2. Реальный A/B на промптах через LLM
-
-Бенчмарк запускал `opencode run --format json` на одних и тех же промптах дважды:
-с прямым подключением всех серверов и через `tokenmaxing`, и сравнивал **реальные токены
-провайдера** из событий `step_finish` (total/input/output/cache/cost). Скрипт
-бенчмарка не входит в минимальный репозиторий; зафиксированные артефакты — в `results/`.
-
-Исторический снимок — **20 промптов** (filesystem, memory, sequential-thinking,
-everything). Полная таблица: `results/ab_tokens_table.md`, графики и разбор —
-в [RESULTS.md](RESULTS.md).
-
-| | direct | gateway | разница |
-|---|---:|---:|---:|
-| input (некэш.) | 169 513 | 175 270 | gateway **+3.4%** |
-| cost | $0.03235 | $0.03932 | gateway **+21.5%** |
-| total (с cache read) | 1 228 334 | 1 220 324 | gateway **−0.7%** |
-
-Ключевой эффект — **кэш определений тулов у провайдера**. В историческом
-20-промптовом прогоне (до adaptive `auto` и кеша использованных тулов) direct
-получал cache-hit'ы на свои 47 определений, а шлюз платил за discovery — на длинной
-серии простых задач direct был дешевле. На первом промпте (кэш холодный) шлюз
-дешевле: input −49.1%, cost −33.1%. Артефакты: `results/ab_tokens.json`,
-`results/ab_tokens_table.md`.
-
-**Когда шлюз выигрывает:** большой или меняющийся каталог, несколько upstream,
-крупные структурированные результаты, холодный кэш, ограничения по контексту.
-**Когда прямой режим проще:** маленький каталог без gateway-обвязки; но `auto`
-теперь отдаёт такие каталоги через passthrough.
-
-Новый снимок (2026-11-26, после гибридного режима, дешёвого discovery, adaptive `auto`,
-компактных мета-схем и кеша):
-`search_tools` для широких запросов стал в **4.9 раза** дешевле, типовой discovery-флоу —
-на **44.7%** дешевле, `schema` вдвое дешевле `full`. Adaptive `auto` на узких запросах
-даёт **−37…−63%** токенов discovery и убирает второй вызов. 7 мета-тулов занимают
-**901** токен вместо 1 409 (−36.1%). Кеш использованных тулов добавляет частые тулы
-в instructions.
-
-Финальный 4-way A/B (filesystem, 16 тулов, 5 промптов): discovery **−18.3% cost**
-и −31.9% input против direct; discovery+кеш **−19.6% cost**; passthrough **−22.8% cost**
-и **−34.8% total**. Это один прогон, вывод хрупкий. Таблицы и оговорки —
-в [RESULTS.md §6](RESULTS.md#6-гибридный-режим-и-дешёвый-discovery-2026-11-26).
-
-## Переменные окружения
-
-| Переменная | По умолчанию | Назначение |
-|------------|--------------|------------|
-| `TOKENMAXING_CONFIG` | `./mcp.json` | Путь к файлу конфигурации. |
-| `TOKENMAXING_MODE` | `auto` | `auto`, `discovery` или `passthrough`. |
-| `TOKENMAXING_PASSTHROUGH_MAX_TOOLS` | `20` | Верхняя граница каталога для auto-passthrough (1–10 000). |
-| `TOKENMAXING_CACHE` | `$XDG_CACHE_HOME/tokenmaxing/usage-<hash>.json` | Путь к кешу использованных тулов; `off` отключает. |
-| `TOKENMAXING_TOOL_CACHE` | `$XDG_CACHE_HOME/tokenmaxing/tool-cache-<hash>.json` | Путь к кешу результатов тулов; `off` отключает. |
-| `TOKENMAXING_EMBEDDINGS_API_KEY` | — | Fallback для `toolCache.embeddings.apiKey`. |
-| `TOKENMAXING_METRICS_ADDR` | `127.0.0.1:9464` | Адрес HTTP-сервера метрик; `off` или пустая строка отключают. |
-| `TOKENMAXING_TOKENIZER` | `o200k_base` | Кодировка tiktoken: `o200k_base`, `cl100k_base`, `p50k_base`, `r50k_base`. Неизвестное значение → `o200k_base` с предупреждением. |
-
-## Поведение и детали
-
-- **Коллизии имён.** Если два сервера отдают тул с одинаковым именем, второй получает
-  префикс `server__tool` (например, `demo__echo`); при повторной коллизии добавляется
-  суффикс `_2`, `_3` и т.д. Имена стабильны в пределах сессии.
-- **Кэш каталога.** Каталог хранится в памяти шлюза; повторная выдача определения
-  не делает лишний `tools/list`. Отдельный кеш использованных тулов описан выше.
-- **`list_changed`.** На `notifications/tools/list_changed` от upstream шлюз
-  перечитывает список и переиндексирует каталог (`src/upstream.rs`). В passthrough он
-  также пересылает уведомление клиенту; в discovery `tools/list` остаётся неизменным.
-- **Выбор режима.** `auto` выбирает passthrough только при полностью подключённом
-  каталоге не больше порога. Ленивые серверы и ошибки подключения автоматически
-  оставляют discovery.
-- **Ошибки вызова.** Неизвестный тул или сервер → JSON-RPC `-32002`; вызов на
-  отключённом сервере → `-32603`; аргументы не объект → `-32602`. Ошибка
-  upstream-тула (`isError`) в `call_tool` проксируется как результат, а не как
-  ошибка транспорта.
-- **Конкурентность.** Запросы обрабатываются параллельно. Если вы говорите со шлюзом
-  вручную через pipe, дожидайтесь ответа на `enable_server` перед `search_tools`;
-  MCP-клиенты делают это автоматически.
-- **Завершение.** При закрытии stdin шлюз завершается и закрывает дочерние
-  upstream-процессы.
-
-## Ограничения
-
-- Поддерживаются только **tools** (resources/prompts не проксируются).
-- Нет OAuth/авторизации для HTTP-серверов (только статические заголовки).
-- Code mode — только JavaScript.
-- `mcp.json` не поддерживает подстановку env-переменных.
-- Авто-сжатие работает только при подключённом сервере Headroom (или совместимом
-  MCP-сервере с инструментами `headroom_compress` / `headroom_retrieve`).
-- Метрики-сервер минимальный: отдаёт `/metrics` по HTTP без аутентификации.
-- В passthrough нет мета-тулов и code mode, а ленивые (`autoConnect: false`) серверы
-  не подключаются. Для них используйте discovery.
-- Кеш результатов тулов выключен по умолчанию, требует явного allowlist и не
-  кеширует ошибки/результаты больше `maxResultBytes`. Semantic-провайдер `hash` —
-  лексический, не настоящий semantic; для реального смысла нужны OpenAI/Ollama.
-- Кеш результатов не уменьшает токены контекста — только повторные upstream-вызовы.
-- В минимальной поставке нет Dockerfile, Makefile и готового `mcp.json` — только
-  Cargo-сборка и ваш конфиг.
-
-## Диагностика
-
-| Симптом | Вероятная причина | Что делать |
-|---------|-------------------|------------|
-| `warning: reading config ...` и пустой каталог | `TOKENMAXING_CONFIG` указывает на отсутствующий файл | Проверьте путь; по умолчанию ищется `./mcp.json`. |
-| `skipping server 'x': must specify either ...` | В записи нет ровно одного транспорта | Укажите либо `command`, либо `url`. |
-| `failed to connect server 'x'` | Команда не в PATH, нет прав или `npx` не скачал пакет | Запустите `command` вручную; проверьте stderr upstream. |
-| Клиент видит только 7 тулов (discovery) | Так и задумано | Модель должна вызвать `search_servers`/`search_tools`; вызовы делает клиент. |
-| Клиент видит все тулы напрямую | Выбран passthrough | Это ожидаемо для маленького каталога; принудительно включите `TOKENMAXING_MODE=discovery`. |
-| В passthrough нет ленивого сервера | Ленивые серверы не подключаются в этом режиме | Используйте `TOKENMAXING_MODE=discovery` и `enable_server`. |
-| `gateway ready ... (mode: ...)` показывает не тот режим | Не все серверы подключились или каталог больше порога | Проверьте `autoConnect`, stderr подключения и `TOKENMAXING_PASSTHROUGH_MAX_TOOLS`. |
-| `enable_server` вернул ошибку `tools/list failed` | Сервер запустился, но не отдал список тулов | Проверьте совместимость и логи upstream. |
-| `metrics: failed to serve on ...` | Порт занят или адрес недоступен | Задайте другой `TOKENMAXING_METRICS_ADDR` или `off`. |
-| Сжатие не применяется | Результат меньше `minBytes`, сервер не подключён или нет выигрыша в токенах | Посмотрите `tokenmaxing_compression_total{outcome}`; уменьшите `minBytes`. |
-| `execute_code` упал по таймауту | Скрипт дольше 10 с по умолчанию | Увеличьте `timeout_ms` (макс. 60 000) или сократите число вызовов. |
-| Два тула с одинаковым именем | Коллизия между серверами | Используйте имя с префиксом `server__tool`. |
-
-## Разработка
-
-Сборка и проверки — через Cargo:
-
-```bash
-cargo build --release --locked
-cargo test
-cargo clippy --all-targets
-cargo fmt
-```
-
-Структура:
-
-| Файл | Назначение |
-|------|-----------|
-| `src/main.rs` | MCP-сервер шлюза и мета-тулы. |
-| `src/config.rs` | Парсинг `mcp.json`. |
-| `src/registry.rs` | Каталог тулов, реестр серверов, соединения. |
-| `src/upstream.rs` | MCP-клиент к upstream, `enable`/`disable`, `list_changed`. |
-| `src/compression.rs` | Авто-сжатие результатов через `headroom_compress`. |
-| `src/code_mode.rs` | Песочница QuickJS и брокер `callTool`. |
-| `src/cache.rs` | Кеш использованных тулов и hot hints. |
-| `src/tool_cache.rs` | Exact/semantic кеш результатов тулов и эмбеддинги. |
-| `src/metrics.rs` | Prometheus-метрики, tiktoken и HTTP-экспорт. |
-| `src/bin/demo_upstream.rs` | Демо upstream-сервер для тестов. |
-| `src/bin/demo_headroom.rs` | Заглушка Headroom для проверки авто-сжатия. |
-| `results/` | Зафиксированные результаты A/B, Headroom и графики. |
-| `RESULTS.md` | Методика, цифры и выводы. |
-| `.claude/agents/tokenmaxing-*.md` | 10 субагентов Claude Code. |
-| `.opencode/agent/tokenmaxing-*.md` | 10 субагентов opencode. |
